@@ -20,30 +20,32 @@ def _parse_iso_utc(ts: str) -> datetime:
     return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(UTC)
 
 
-def _entry_price_from_book(side: str, mid: float, spread: float) -> float:
-    half = max(0.0, spread / 2.0)
-    best_bid = max(0.0, mid - half)
-    best_ask = mid + half
-    return best_ask if side == "long" else best_bid
-
-
-def _exit_price_from_book(side: str, mid: float, spread: float) -> float:
-    half = max(0.0, spread / 2.0)
-    best_bid = max(0.0, mid - half)
-    best_ask = mid + half
-    # Close long selling at bid; close short buying at ask.
-    return best_bid if side == "long" else best_ask
-
-
-def _best_bid_ask(mid: float, spread: float) -> tuple[float, float]:
+def _best_bid_ask_from_latest(latest: dict[str, Any], mid: float, spread: float) -> tuple[float, float]:
+    bid_l1 = _safe_float(latest.get("bid_price_l1"), 0.0)
+    ask_l1 = _safe_float(latest.get("ask_price_l1"), 0.0)
+    if bid_l1 > 0 and ask_l1 > 0 and ask_l1 >= bid_l1:
+        return bid_l1, ask_l1
     half = max(0.0, spread / 2.0)
     best_bid = max(0.0, mid - half)
     best_ask = mid + half
     return best_bid, best_ask
 
 
+def _entry_price_from_book(side: str, latest: dict[str, Any], mid: float, spread: float) -> float:
+    best_bid, best_ask = _best_bid_ask_from_latest(latest, mid, spread)
+    return best_ask if side == "long" else best_bid
+
+
+def _exit_price_from_book(side: str, latest: dict[str, Any], mid: float, spread: float) -> float:
+    best_bid, best_ask = _best_bid_ask_from_latest(latest, mid, spread)
+    # Close long selling at bid; close short buying at ask.
+    return best_bid if side == "long" else best_ask
+
+
 def _ioc_fills(side: str, limit_price: float, mid: float, spread: float) -> bool:
-    best_bid, best_ask = _best_bid_ask(mid, spread)
+    half = max(0.0, spread / 2.0)
+    best_bid = max(0.0, mid - half)
+    best_ask = mid + half
     if side == "long":
         return limit_price >= best_ask and best_ask > 0
     if side == "short":
@@ -296,7 +298,9 @@ def _open_position(state: dict[str, Any], side: str, entry: float, params: dict[
     return pos
 
 
-def _try_close_position(state: dict[str, Any], mid: float, spread: float, ts: str) -> dict[str, Any] | None:
+def _try_close_position(
+    state: dict[str, Any], latest: dict[str, Any], mid: float, spread: float, ts: str
+) -> dict[str, Any] | None:
     pos = state.get("open_position")
     if not pos:
         return None
@@ -306,7 +310,7 @@ def _try_close_position(state: dict[str, Any], mid: float, spread: float, ts: st
     entry = float(pos["entry_price"])
     should_close = False
     exit_reason = ""
-    exit_price = _exit_price_from_book(side, mid, spread)
+    exit_price = _exit_price_from_book(side, latest, mid, spread)
     if side == "long":
         if mid <= sl:
             should_close = True
@@ -419,7 +423,7 @@ def run_forever(poll_seconds: int = 20) -> None:
                         "spread": spread,
                     },
                 )
-                closed = _try_close_position(state, mid, spread, ts)
+                closed = _try_close_position(state, latest, mid, spread, ts)
                 if closed is not None:
                     event_happened = True
                     _append_jsonl(trades_path, closed)
@@ -440,7 +444,8 @@ def run_forever(poll_seconds: int = 20) -> None:
                     max_ioc_levels = int(params.get("paper_ioc_max_levels", 5))
                     if sig.confidence >= min_conf and spread <= max_spread:
                         if sig.action_intent in ("long", "short"):
-                            entry_px = _entry_price_from_book(sig.action_intent, mid, spread)
+                            best_bid, best_ask = _best_bid_ask_from_latest(latest, mid, spread)
+                            entry_px = _entry_price_from_book(sig.action_intent, latest, mid, spread)
                             draft_pos = _open_position(state, sig.action_intent, entry_px, params, ts)
                             state["open_position"] = None
                             req_qty = float(draft_pos["qty"])
@@ -474,7 +479,7 @@ def run_forever(poll_seconds: int = 20) -> None:
                             else:
                                 event_happened = True
                                 print(
-                                    f"[paper_sim] ioc_canceled mode={fill_mode} side={sig.action_intent} limit={entry_px:.2f} mid={mid:.2f} spread={spread:.2f} qty={req_qty:.6f} filled={float(fill.get('filled_qty', 0.0)):.6f} reason={fill.get('reason', 'unknown')}",
+                                    f"[paper_sim] ioc_canceled mode={fill_mode} side={sig.action_intent} limit={entry_px:.2f} bid={best_bid:.2f} ask={best_ask:.2f} mid={mid:.2f} spread={spread:.2f} qty={req_qty:.6f} filled={float(fill.get('filled_qty', 0.0)):.6f} reason={fill.get('reason', 'unknown')}",
                                     flush=True,
                                 )
                 _save_state(state_path, _state_summary(state))
