@@ -80,3 +80,17 @@ $env:PYTHONPATH="src"; .\.venv\Scripts\python.exe -m binance_bot.mt5.build_regim
 Saída:
 - `data/processed/mt5/BTCUSD/regime/regime_features_YYYYMMDD.parquet`
 - `artifacts/reports/mt5_regime_summary.json`
+
+## Champion Management
+
+Arquivar campeao atual (antes de novo treino):
+
+```powershell
+$env:PYTHONPATH="src"; .\.venv\Scripts\python.exe -m binance_bot.training.archive_champion
+```
+
+Promover campeao escolhido manualmente:
+
+```powershell
+$env:PYTHONPATH="src"; .\.venv\Scripts\python.exe -m binance_bot.training.promote_champion --source artifacts\champions_archive\SEU_ARQUIVO.json
+```
