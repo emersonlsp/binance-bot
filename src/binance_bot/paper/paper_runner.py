@@ -274,9 +274,21 @@ def _open_position(state: dict[str, Any], side: str, entry: float, params: dict[
     trading = load_trading_params()
     stop_loss_pct = trading.risk.default_stop_loss_pct
     rr = trading.risk.risk_reward_ratio
-    risk_brl = state["bankroll_brl"] * trading.risk.max_risk_per_trade_pct
-    position_notional = risk_brl / max(stop_loss_pct, 1.0e-12)
+    # Binance-style sizing: define order notional (quote BRL), then convert to base qty.
+    raw_notional = state["bankroll_brl"] * trading.risk.order_notional_pct
+    risk_cap_notional = (state["bankroll_brl"] * trading.risk.max_risk_per_trade_pct) / max(
+        stop_loss_pct, 1.0e-12
+    )
+    min_notional = max(0.0, float(getattr(trading.risk, "min_position_notional_brl", 0.0)))
+    max_notional = max(0.0, float(getattr(trading.risk, "max_position_notional_brl", 0.0)))
+    position_notional = raw_notional
+    if min_notional > 0:
+        position_notional = max(position_notional, min_notional)
+    if max_notional > 0:
+        position_notional = min(position_notional, max_notional)
+    position_notional = min(position_notional, risk_cap_notional)
     qty = position_notional / max(entry, 1.0e-12)
+    risk_brl = position_notional * stop_loss_pct
     if side == "long":
         sl = entry * (1.0 - stop_loss_pct)
         tp = entry * (1.0 + (stop_loss_pct * rr))
@@ -289,6 +301,7 @@ def _open_position(state: dict[str, Any], side: str, entry: float, params: dict[
         "stop_loss": sl,
         "take_profit": tp,
         "risk_brl": risk_brl,
+        "raw_notional_brl": raw_notional,
         "position_notional_brl": position_notional,
         "qty": qty,
         "opened_at": ts,
@@ -473,7 +486,7 @@ def run_forever(poll_seconds: int = 20) -> None:
                                     flush=True,
                                 )
                                 print(
-                                    f"[paper_sim] open {pos['side']} entry={pos['entry_price']:.2f} sl={pos['stop_loss']:.2f} tp={pos['take_profit']:.2f}",
+                                    f"[paper_sim] open {pos['side']} entry={pos['entry_price']:.2f} sl={pos['stop_loss']:.2f} tp={pos['take_profit']:.2f} qty={float(pos['qty']):.6f} notional={float(pos['position_notional_brl']):.2f} raw_notional={float(pos.get('raw_notional_brl', pos['position_notional_brl'])):.2f}",
                                     flush=True,
                                 )
                             else:

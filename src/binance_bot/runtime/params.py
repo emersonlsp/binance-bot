@@ -13,6 +13,9 @@ class RiskParams:
     risk_reward_ratio: float = 1.0
     margin_mode: str = "isolated"
     paper_bankroll_brl: float = 500.0
+    order_notional_pct: float = 0.01
+    min_position_notional_brl: float = 50.0
+    max_position_notional_brl: float = 3000.0
 
 
 @dataclass(slots=True)
@@ -33,5 +36,8 @@ def load_trading_params(path: Path | None = None) -> TradingParams:
             risk_reward_ratio=float(risk.get("risk_reward_ratio", 1.0)),
             margin_mode=str(risk.get("margin_mode", "isolated")).lower(),
             paper_bankroll_brl=float(risk.get("paper_bankroll_brl", 500.0)),
+            order_notional_pct=float(risk.get("order_notional_pct", 0.01)),
+            min_position_notional_brl=float(risk.get("min_position_notional_brl", 50.0)),
+            max_position_notional_brl=float(risk.get("max_position_notional_brl", 3000.0)),
         )
     )
