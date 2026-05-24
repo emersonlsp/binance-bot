@@ -91,6 +91,14 @@ def _load_state(path: Path, initial_bankroll: float) -> dict[str, Any]:
     }
 
 
+def _latest_feature_ts(champion: dict[str, Any]) -> str:
+    try:
+        _, latest, _ = _build_strategy_and_latest_feature(champion)
+        return str(latest.get("ts_receive", ""))
+    except Exception:
+        return ""
+
+
 def _save_state(path: Path, state: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -251,8 +259,23 @@ def run_forever(poll_seconds: int = 20) -> None:
     trades_path = out / "trades.jsonl"
     trading = load_trading_params()
     state = _load_state(state_path, trading.risk.paper_bankroll_brl)
+    # Start every session flat to avoid inheriting stale simulated positions.
+    if state.get("open_position") is not None:
+        state["open_position"] = None
+    # Do not trade on startup snapshot; wait for a new feature tick after boot.
+    boot_ts = _latest_feature_ts(champion)
+    if boot_ts:
+        state["last_feature_ts"] = boot_ts
     _save_state(state_path, _state_summary(state))
-    print("[paper_sim] started", _now_iso(), "bankroll=", state["bankroll_brl"], flush=True)
+    print(
+        "[paper_sim] started",
+        _now_iso(),
+        "bankroll=",
+        state["bankroll_brl"],
+        "bootstrap_ts=",
+        state.get("last_feature_ts", ""),
+        flush=True,
+    )
     last_heartbeat = 0.0
     max_feature_age_seconds = 120.0
     while True:
