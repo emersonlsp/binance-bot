@@ -403,7 +403,9 @@ def run_forever(poll_seconds: int = 20) -> None:
         flush=True,
     )
     last_heartbeat = 0.0
-    max_feature_age_seconds = 120.0
+    max_feature_age_seconds = float(
+        champion.get("params", {}).get("paper_max_feature_age_seconds", 5.0)
+    )
     while True:
         try:
             event_happened = False
@@ -413,7 +415,7 @@ def run_forever(poll_seconds: int = 20) -> None:
                 age_seconds = (datetime.now(UTC) - _parse_iso_utc(ts)).total_seconds()
                 if age_seconds > max_feature_age_seconds:
                     print(
-                        f"[paper_sim] dado atrasado ({age_seconds:.0f}s). aguardando dado novo...",
+                        f"[paper_sim] dado atrasado ts={ts} age_s={age_seconds:.1f}s (max={max_feature_age_seconds:.1f}s). aguardando dado novo...",
                         flush=True,
                     )
                     now = time.time()
@@ -482,17 +484,17 @@ def run_forever(poll_seconds: int = 20) -> None:
                                 pos = _open_position(state, sig.action_intent, avg_entry, params, ts)
                                 event_happened = True
                                 print(
-                                    f"[paper_sim] ioc_filled mode={fill_mode} side={sig.action_intent} limit={entry_px:.2f} avg={avg_entry:.2f} best={float(fill.get('best_price', 0.0)):.2f} worst={float(fill.get('worst_price', 0.0)):.2f} levels={int(fill.get('used_levels', 0))} qty={req_qty:.6f}",
+                                    f"[paper_sim] ioc_filled ts={ts} age_s={age_seconds:.2f} mode={fill_mode} side={sig.action_intent} limit={entry_px:.2f} avg={avg_entry:.2f} best={float(fill.get('best_price', 0.0)):.2f} worst={float(fill.get('worst_price', 0.0)):.2f} levels={int(fill.get('used_levels', 0))} qty={req_qty:.6f}",
                                     flush=True,
                                 )
                                 print(
-                                    f"[paper_sim] open {pos['side']} entry={pos['entry_price']:.2f} sl={pos['stop_loss']:.2f} tp={pos['take_profit']:.2f} qty={float(pos['qty']):.6f} notional={float(pos['position_notional_brl']):.2f} raw_notional={float(pos.get('raw_notional_brl', pos['position_notional_brl'])):.2f}",
+                                    f"[paper_sim] open ts={ts} side={pos['side']} entry={pos['entry_price']:.2f} sl={pos['stop_loss']:.2f} tp={pos['take_profit']:.2f} qty={float(pos['qty']):.6f} notional={float(pos['position_notional_brl']):.2f} raw_notional={float(pos.get('raw_notional_brl', pos['position_notional_brl'])):.2f}",
                                     flush=True,
                                 )
                             else:
                                 event_happened = True
                                 print(
-                                    f"[paper_sim] ioc_canceled mode={fill_mode} side={sig.action_intent} limit={entry_px:.2f} bid={best_bid:.2f} ask={best_ask:.2f} mid={mid:.2f} spread={spread:.2f} qty={req_qty:.6f} filled={float(fill.get('filled_qty', 0.0)):.6f} reason={fill.get('reason', 'unknown')}",
+                                    f"[paper_sim] ioc_canceled ts={ts} age_s={age_seconds:.2f} mode={fill_mode} side={sig.action_intent} limit={entry_px:.2f} bid={best_bid:.2f} ask={best_ask:.2f} mid={mid:.2f} spread={spread:.2f} qty={req_qty:.6f} filled={float(fill.get('filled_qty', 0.0)):.6f} reason={fill.get('reason', 'unknown')}",
                                     flush=True,
                                 )
                 _save_state(state_path, _state_summary(state))
@@ -503,7 +505,7 @@ def run_forever(poll_seconds: int = 20) -> None:
                     print("[paper_sim] analisando mercado... sem novo evento", flush=True)
                 else:
                     print(
-                        f"[paper_sim] trade aberta side={open_pos['side']} entry={float(open_pos['entry_price']):.2f} sl={float(open_pos['stop_loss']):.2f} tp={float(open_pos['take_profit']):.2f}",
+                        f"[paper_sim] trade aberta side={open_pos['side']} entry={float(open_pos['entry_price']):.2f} sl={float(open_pos['stop_loss']):.2f} tp={float(open_pos['take_profit']):.2f} opened_at={open_pos.get('opened_at','')}",
                         flush=True,
                     )
                 last_heartbeat = now
