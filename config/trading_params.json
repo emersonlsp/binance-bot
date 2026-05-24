@@ -1,0 +1,12 @@
+{
+  "risk": {
+    "max_risk_per_trade_pct": 0.01,
+    "default_stop_loss_pct": 0.005,
+    "risk_reward_ratio": 1.0,
+    "margin_mode": "isolated",
+    "paper_bankroll_brl": 20000.0
+  },
+  "notes": {
+    "description": "Runtime trading parameters (paper/live). Keep environment variables for secrets only."
+  }
+}

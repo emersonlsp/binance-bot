@@ -1,0 +1,29 @@
+{
+  "enabled": false,
+  "symbol": "BTCBRL",
+  "strategy_source": {
+    "champion_file": "artifacts/champion_strategy.json"
+  },
+  "execution": {
+    "mode": "simulated",
+    "fill_model": "mid_plus_slippage",
+    "slippage_bps_per_side": 1.0,
+    "max_open_positions": 1
+  },
+  "risk": {
+    "min_signal_confidence": 0.55,
+    "max_spread_brl": 20.0,
+    "allow_short": true
+  },
+  "position_rules": {
+    "time_stop_minutes": 120,
+    "trailing_stop_enabled": true,
+    "trailing_activation_rr": 1.0,
+    "trailing_distance_rr": 0.75,
+    "trailing_lock_breakeven": true,
+    "disable_take_profit_when_trailing": true
+  },
+  "storage": {
+    "base_dir": "artifacts/paper_mode"
+  }
+}
