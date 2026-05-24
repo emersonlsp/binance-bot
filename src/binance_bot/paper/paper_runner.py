@@ -376,7 +376,7 @@ def _try_close_position(
     }
 
 
-def run_forever(poll_seconds: int = 20) -> None:
+def run_forever(poll_seconds: int = 2) -> None:
     load_dotenv()
     champion = _load_champion()
     out = Path("artifacts/paper_sim")
@@ -515,7 +515,7 @@ def run_forever(poll_seconds: int = 20) -> None:
 
 
 def main() -> None:
-    run_forever(poll_seconds=20)
+    run_forever(poll_seconds=2)
 
 
 if __name__ == "__main__":
