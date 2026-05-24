@@ -22,7 +22,7 @@ Duplo clique no Windows:
 - execute `start_collector.pyw`
 - logs em `logs/collector_YYYYMMDD.log`
 
-Paper runner (simulado, separado do coletor):
+Paper runner realtime (simulado, separado do coletor):
 - execute `start_paper.pyw`
 - artefatos em `artifacts/paper_sim/`
   - `paper_report.json` (resumo atual: trades, win rate, pnl, retorno, drawdown)
