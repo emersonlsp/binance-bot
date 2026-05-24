@@ -250,11 +250,6 @@ def run_forever(poll_seconds: int = 20) -> None:
                                 f"[paper_live] open {pos['side']} entry={pos['entry_price']:.2f} sl={pos['stop_loss']:.2f} tp={pos['take_profit']:.2f}",
                                 flush=True,
                             )
-                            summary = _state_summary(state)
-                            print(
-                                f"[paper_live] summary trades={summary['trades_count']} win_rate={summary['win_rate']:.2%} pnl={summary['realized_pnl_brl']:.2f} return={summary['return_pct']:.2%} dd={summary['max_drawdown_brl']:.2f}",
-                                flush=True,
-                            )
                 _save_state(state_path, _state_summary(state))
         except Exception as exc:
             print("[paper_live] cycle_error", str(exc), flush=True)
