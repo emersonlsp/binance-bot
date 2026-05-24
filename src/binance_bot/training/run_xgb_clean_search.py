@@ -30,6 +30,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Parallel worker processes (use 2-6 depending on CPU/RAM).",
     )
     p.add_argument(
+        "--regime-gate",
+        choices=["on", "off"],
+        default="off",
+        help="Enable MT5 candle regime gate during signal evaluation.",
+    )
+    p.add_argument(
+        "--regime-chop-min-confidence",
+        type=float,
+        default=0.78,
+        help="When regime gate is enabled, minimum confidence to allow trades in chop regime.",
+    )
+    p.add_argument(
         "--output-dir",
         type=Path,
         default=Path("artifacts/reports/xgb_clean_search"),
@@ -53,6 +65,8 @@ def main() -> None:
         min_positive_folds=args.min_positive_folds,
         seed=args.seed,
         workers=args.workers,
+        regime_gate=(args.regime_gate == "on"),
+        regime_chop_min_confidence=args.regime_chop_min_confidence,
     )
     result = run_xgb_clean_search(
         raw_root=args.raw_root,
@@ -70,6 +84,19 @@ def main() -> None:
             "trades=",
             int(s["total_trades"]),
         )
+    promoted = result.get("promoted_champion")
+    if promoted:
+        ps = promoted["summary"]
+        print(
+            "[xgb_clean] promoted:",
+            promoted["name"],
+            "pnl_brl=",
+            round(float(ps["mean_pnl_net_brl"]), 2),
+            "trades=",
+            int(ps["total_trades"]),
+        )
+    else:
+        print("[xgb_clean] promoted: none (did not beat baseline gate)")
     print("[xgb_clean] done. leaderboard:", args.output_dir / "leaderboard.json")
 
 

@@ -5,6 +5,7 @@ __pycache__/
 *.pyc
 .env
 data/
+data_vps/
 artifacts/
 *.log
 

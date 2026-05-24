@@ -371,6 +371,120 @@ def _pnl_net_brl(
     return pnl, trades, max_dd, expectancy
 
 
+def _build_trade_plans_and_equity(
+    rows: list[dict[str, Any]],
+    preds: list[int],
+    *,
+    all_rows: list[dict[str, Any]],
+    horizon_steps: int,
+    cost_bps_side: float,
+    bankroll_brl: float,
+    risk_pct: float,
+    stop_loss_pct: float,
+    risk_reward_ratio: float,
+    trailing_enabled: bool,
+    trailing_activation_rr: float,
+    trailing_distance_rr: float,
+    trailing_lock_breakeven: bool,
+    disable_take_profit_when_trailing: bool,
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    if bankroll_brl <= 0 or risk_pct <= 0 or stop_loss_pct <= 0:
+        return [], {
+            "start_bankroll_brl": bankroll_brl,
+            "final_bankroll_brl": bankroll_brl,
+            "max_drawdown_brl": 0.0,
+            "max_drawdown_pct": 0.0,
+            "return_pct": 0.0,
+            "trades": 0.0,
+            "wins": 0.0,
+            "losses": 0.0,
+            "win_rate": 0.0,
+        }
+
+    plans: list[dict[str, Any]] = []
+    bankroll = bankroll_brl
+    peak = bankroll_brl
+    max_dd = 0.0
+    wins = 0
+    losses = 0
+    cost = 2.0 * (cost_bps_side / 10000.0)
+
+    for row, p in zip(rows, preds):
+        if p == 0:
+            continue
+        row_idx = int(row.get("row_idx", -1))
+        if row_idx < 0:
+            continue
+        entry = float(row.get("mid_price", 0.0))
+        if entry <= 0:
+            continue
+        risk_amount = bankroll * risk_pct
+        position_notional = risk_amount / stop_loss_pct
+        qty = position_notional / entry
+        is_long = p == 1
+        sl = entry * (1.0 - stop_loss_pct) if is_long else entry * (1.0 + stop_loss_pct)
+        tp = (
+            entry * (1.0 + (stop_loss_pct * risk_reward_ratio))
+            if is_long
+            else entry * (1.0 - (stop_loss_pct * risk_reward_ratio))
+        )
+        trade_ret = _simulate_trade_ret(
+            all_rows=all_rows,
+            row_idx=row_idx,
+            side=p,
+            horizon_steps=horizon_steps,
+            stop_loss_pct=stop_loss_pct,
+            risk_reward_ratio=risk_reward_ratio,
+            trailing_enabled=trailing_enabled,
+            trailing_activation_rr=trailing_activation_rr,
+            trailing_distance_rr=trailing_distance_rr,
+            trailing_lock_breakeven=trailing_lock_breakeven,
+            disable_take_profit_when_trailing=disable_take_profit_when_trailing,
+        )
+        trade_pnl_brl = (trade_ret - cost) * position_notional
+        bankroll += trade_pnl_brl
+        if trade_pnl_brl >= 0:
+            wins += 1
+        else:
+            losses += 1
+        if bankroll > peak:
+            peak = bankroll
+        dd = peak - bankroll
+        if dd > max_dd:
+            max_dd = dd
+        plans.append(
+            {
+                "ts_receive": row.get("ts_receive"),
+                "side": "long" if is_long else "short",
+                "entry_price": entry,
+                "stop_loss": sl,
+                "take_profit": tp,
+                "risk_brl": risk_amount,
+                "position_notional_brl": position_notional,
+                "qty": qty,
+                "pnl_brl": trade_pnl_brl,
+                "bankroll_after_brl": bankroll,
+            }
+        )
+
+    trades = len(plans)
+    win_rate = (wins / trades) if trades else 0.0
+    max_dd_pct = (max_dd / peak) if peak > 0 else 0.0
+    ret_pct = ((bankroll / bankroll_brl) - 1.0) if bankroll_brl > 0 else 0.0
+    equity = {
+        "start_bankroll_brl": bankroll_brl,
+        "final_bankroll_brl": bankroll,
+        "max_drawdown_brl": max_dd,
+        "max_drawdown_pct": max_dd_pct,
+        "return_pct": ret_pct,
+        "trades": float(trades),
+        "wins": float(wins),
+        "losses": float(losses),
+        "win_rate": win_rate,
+    }
+    return plans, equity
+
+
 def _evaluate_paper_aligned_rows(
     *,
     feature_rows: list[dict[str, Any]],
@@ -382,12 +496,16 @@ def _evaluate_paper_aligned_rows(
     cost_bps_per_side: float,
     min_signal_confidence: float,
     max_spread_brl: float,
-) -> tuple[list[FoldResult], list[dict[str, float]]]:
+    regime_gate_enabled: bool = False,
+    regime_chop_min_confidence: float = 0.78,
+) -> tuple[list[FoldResult], list[dict[str, float]], list[dict[str, Any]], list[dict[str, Any]]]:
     trading_params = load_trading_params()
     paper_cfg = load_paper_mode_config()
     splits = _walk_forward_splits(len(labeled_rows), n_folds)
     folds: list[FoldResult] = []
     folds_brl: list[dict[str, float]] = []
+    fold_equity: list[dict[str, Any]] = []
+    fold_trade_samples: list[dict[str, Any]] = []
     for i, (train_start, train_end, test_end) in enumerate(splits, start=1):
         train_rows = labeled_rows[train_start:train_end]
         test_rows = labeled_rows[train_end:test_end]
@@ -400,7 +518,16 @@ def _evaluate_paper_aligned_rows(
         for r in test_rows:
             sig = strategy.predict(r)
             spread = float(r.get("spread", 0.0))
-            if sig.confidence < min_signal_confidence or spread > max_spread_brl:
+            regime_label = str(r.get("regime_label", ""))
+            if regime_gate_enabled and regime_label == "high_vol_shock":
+                intent = "none"
+            elif (
+                regime_gate_enabled
+                and regime_label == "chop"
+                and sig.confidence < regime_chop_min_confidence
+            ):
+                intent = "none"
+            elif sig.confidence < min_signal_confidence or spread > max_spread_brl:
                 intent = "none"
             else:
                 intent = sig.action_intent
@@ -437,6 +564,30 @@ def _evaluate_paper_aligned_rows(
             disable_take_profit_when_trailing=paper_cfg.position_rules.disable_take_profit_when_trailing,
         )
         folds.append(FoldResult(i, len(train_rows), len(test_rows), acc, pnl, trades))
+        trade_plans, equity = _build_trade_plans_and_equity(
+            test_rows,
+            y_pred,
+            all_rows=feature_rows,
+            horizon_steps=horizon_steps,
+            cost_bps_side=cost_bps_per_side,
+            bankroll_brl=trading_params.risk.paper_bankroll_brl,
+            risk_pct=trading_params.risk.max_risk_per_trade_pct,
+            stop_loss_pct=trading_params.risk.default_stop_loss_pct,
+            risk_reward_ratio=trading_params.risk.risk_reward_ratio,
+            trailing_enabled=paper_cfg.position_rules.trailing_stop_enabled,
+            trailing_activation_rr=paper_cfg.position_rules.trailing_activation_rr,
+            trailing_distance_rr=paper_cfg.position_rules.trailing_distance_rr,
+            trailing_lock_breakeven=paper_cfg.position_rules.trailing_lock_breakeven,
+            disable_take_profit_when_trailing=paper_cfg.position_rules.disable_take_profit_when_trailing,
+        )
+        fold_equity.append({"fold_id": i, **equity})
+        fold_trade_samples.append(
+            {
+                "fold_id": i,
+                "trade_count": len(trade_plans),
+                "trades_sample": trade_plans[:10],
+            }
+        )
         folds_brl.append(
             {
                 "fold_id": i,
@@ -446,7 +597,7 @@ def _evaluate_paper_aligned_rows(
                 "expectancy_brl_per_trade": expectancy_brl,
             }
         )
-    return folds, folds_brl
+    return folds, folds_brl, fold_equity, fold_trade_samples
 
 
 def build_paper_aligned_dataset(
@@ -490,10 +641,12 @@ def run_paper_aligned_training_from_dataset(
     strategy_kwargs: dict[str, Any] | None = None,
     min_signal_confidence: float = 0.0,
     max_spread_brl: float = 1.0e12,
+    regime_gate_enabled: bool = False,
+    regime_chop_min_confidence: float = 0.78,
 ) -> dict[str, Any]:
     feature_rows = dataset["feature_rows"]
     labeled_rows = dataset["labeled_rows"]
-    folds, folds_brl = _evaluate_paper_aligned_rows(
+    folds, folds_brl, fold_equity, fold_trade_samples = _evaluate_paper_aligned_rows(
         feature_rows=feature_rows,
         labeled_rows=labeled_rows,
         strategy_name=strategy_name,
@@ -503,6 +656,8 @@ def run_paper_aligned_training_from_dataset(
         cost_bps_per_side=cost_bps_per_side,
         min_signal_confidence=min_signal_confidence,
         max_spread_brl=max_spread_brl,
+        regime_gate_enabled=regime_gate_enabled,
+        regime_chop_min_confidence=regime_chop_min_confidence,
     )
 
     trading_params = load_trading_params()
@@ -518,6 +673,8 @@ def run_paper_aligned_training_from_dataset(
         "strategy_kwargs": strategy_kwargs or {},
         "min_signal_confidence": min_signal_confidence,
         "max_spread_brl": max_spread_brl,
+        "regime_gate_enabled": regime_gate_enabled,
+        "regime_chop_min_confidence": regime_chop_min_confidence,
         "execution_backtest": {
             "stop_loss_pct": trading_params.risk.default_stop_loss_pct,
             "risk_reward_ratio": trading_params.risk.risk_reward_ratio,
@@ -529,6 +686,8 @@ def run_paper_aligned_training_from_dataset(
         },
         "folds": [asdict(f) for f in folds],
         "folds_brl": folds_brl,
+        "fold_equity": fold_equity,
+        "fold_trade_samples": fold_trade_samples,
         "summary": {
             "mean_accuracy": (sum(f.accuracy for f in folds) / len(folds)) if folds else 0.0,
             "mean_pnl_net": (sum(f.pnl_net for f in folds) / len(folds)) if folds else 0.0,
@@ -545,6 +704,17 @@ def run_paper_aligned_training_from_dataset(
                 sum(f["expectancy_brl_per_trade"] for f in folds_brl) / len(folds_brl)
                 if folds_brl
                 else 0.0
+            ),
+            "mean_final_bankroll_brl": (
+                sum(f["final_bankroll_brl"] for f in fold_equity) / len(fold_equity)
+                if fold_equity
+                else trading_params.risk.paper_bankroll_brl
+            ),
+            "mean_return_pct": (
+                sum(f["return_pct"] for f in fold_equity) / len(fold_equity) if fold_equity else 0.0
+            ),
+            "mean_win_rate": (
+                sum(f["win_rate"] for f in fold_equity) / len(fold_equity) if fold_equity else 0.0
             ),
         },
     }
@@ -566,6 +736,8 @@ def run_paper_aligned_training(
     strategy_kwargs: dict[str, Any] | None = None,
     min_signal_confidence: float = 0.0,
     max_spread_brl: float = 1.0e12,
+    regime_gate_enabled: bool = False,
+    regime_chop_min_confidence: float = 0.78,
 ) -> dict[str, Any]:
     dataset = build_paper_aligned_dataset(
         raw_root=raw_root,
@@ -585,4 +757,6 @@ def run_paper_aligned_training(
         strategy_kwargs=strategy_kwargs,
         min_signal_confidence=min_signal_confidence,
         max_spread_brl=max_spread_brl,
+        regime_gate_enabled=regime_gate_enabled,
+        regime_chop_min_confidence=regime_chop_min_confidence,
     )

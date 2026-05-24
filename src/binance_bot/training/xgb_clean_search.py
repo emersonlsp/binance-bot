@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from random import Random
+from bisect import bisect_right
 from typing import Any
 
 import pyarrow as pa
@@ -22,6 +23,8 @@ class SearchConfig:
     min_positive_folds: int = 3
     seed: int = 42
     workers: int = 1
+    regime_gate: bool = False
+    regime_chop_min_confidence: float = 0.78
 
 
 def _sample_candidate(
@@ -74,6 +77,79 @@ def _score(entry: dict[str, Any], *, min_trades: int, min_positive_folds: int) -
     return pnl + (25.0 * expectancy) - (0.20 * dd) + penalty
 
 
+def _fold_stability(folds_brl: list[dict[str, Any]]) -> dict[str, float]:
+    pnls = [float(x.get("pnl_net_brl", 0.0)) for x in folds_brl]
+    total = len(pnls)
+    if total == 0:
+        return {"positive_folds": 0.0, "positive_ratio": 0.0, "worst_fold_pnl_brl": 0.0}
+    positive = sum(1 for x in pnls if x > 0)
+    return {
+        "positive_folds": float(positive),
+        "positive_ratio": float(positive / total),
+        "worst_fold_pnl_brl": float(min(pnls)),
+    }
+
+
+def _evaluate_baselines(
+    *,
+    output_dir: Path,
+    dataset: dict[str, Any],
+    dataset_key: str,
+    horizon_steps: int,
+    sample_every_updates: int,
+    n_folds: int,
+    regime_gate_enabled: bool,
+    regime_chop_min_confidence: float,
+) -> list[dict[str, Any]]:
+    specs = [
+        ("baseline_no_trade_v1", {}, 0.0, 1.0e12),
+        ("baseline_imbalance_v1", {"long_threshold": 0.08, "short_threshold": -0.08}, 0.0, 2.5),
+    ]
+    out: list[dict[str, Any]] = []
+    for strategy_name, kwargs, min_conf, max_spread in specs:
+        report = run_paper_aligned_training_from_dataset(
+            dataset=dataset,
+            report_output_path=output_dir / f"{dataset_key}_{strategy_name}.json",
+            strategy_name=strategy_name,
+            strategy_kwargs=kwargs,
+            horizon_steps=horizon_steps,
+            n_folds=n_folds,
+            cost_bps_per_side=1.5,
+            sample_every_updates=sample_every_updates,
+            min_signal_confidence=min_conf,
+            max_spread_brl=max_spread,
+            regime_gate_enabled=regime_gate_enabled,
+            regime_chop_min_confidence=regime_chop_min_confidence,
+        )
+        stability = _fold_stability(report.get("folds_brl", []))
+        out.append(
+            {
+                "name": strategy_name,
+                "summary": report["summary"],
+                "folds_brl": report.get("folds_brl", []),
+                "stability": stability,
+            }
+        )
+    return out
+
+
+def _best_baseline(baselines: list[dict[str, Any]]) -> dict[str, Any]:
+    if not baselines:
+        return {
+            "name": "baseline_no_trade_v1",
+            "summary": {"mean_pnl_net_brl": 0.0},
+            "stability": {"positive_ratio": 0.0},
+        }
+    return sorted(
+        baselines,
+        key=lambda b: (
+            float(b["summary"].get("mean_pnl_net_brl", 0.0)),
+            float(b["stability"].get("positive_ratio", 0.0)),
+        ),
+        reverse=True,
+    )[0]
+
+
 def _evaluate_candidate(
     candidate: dict[str, Any],
     *,
@@ -84,6 +160,9 @@ def _evaluate_candidate(
     n_folds: int,
     min_trades: int,
     min_positive_folds: int,
+    baseline_ref: dict[str, Any],
+    regime_gate_enabled: bool,
+    regime_chop_min_confidence: float,
 ) -> dict[str, Any]:
     report = run_paper_aligned_training_from_dataset(
         dataset=dataset,
@@ -96,6 +175,8 @@ def _evaluate_candidate(
         sample_every_updates=sample_every_updates,
         min_signal_confidence=float(candidate["min_signal_confidence"]),
         max_spread_brl=float(candidate["max_spread_brl"]),
+        regime_gate_enabled=regime_gate_enabled,
+        regime_chop_min_confidence=regime_chop_min_confidence,
     )
     entry = {
         "name": candidate["name"],
@@ -113,6 +194,22 @@ def _evaluate_candidate(
         "summary": report["summary"],
         "folds_brl": report.get("folds_brl", []),
     }
+    stability = _fold_stability(entry["folds_brl"])
+    base_pnl = float(baseline_ref["summary"].get("mean_pnl_net_brl", 0.0))
+    base_stability = float(baseline_ref["stability"].get("positive_ratio", 0.0))
+    cand_pnl = float(entry["summary"].get("mean_pnl_net_brl", 0.0))
+    cand_stability = float(stability.get("positive_ratio", 0.0))
+    gate = {
+        "baseline_ref": baseline_ref["name"],
+        "baseline_pnl_brl": base_pnl,
+        "baseline_positive_ratio": base_stability,
+        "candidate_positive_ratio": cand_stability,
+        "pass_pnl_vs_baseline": cand_pnl > base_pnl,
+        "pass_stability_vs_baseline": cand_stability >= base_stability,
+    }
+    gate["promote"] = bool(gate["pass_pnl_vs_baseline"] and gate["pass_stability_vs_baseline"])
+    entry["stability"] = stability
+    entry["gate"] = gate
     entry["score"] = _score(
         entry,
         min_trades=min_trades,
@@ -131,6 +228,9 @@ def _evaluate_group(
     n_folds: int,
     min_trades: int,
     min_positive_folds: int,
+    baseline_ref: dict[str, Any],
+    regime_gate_enabled: bool,
+    regime_chop_min_confidence: float,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -144,9 +244,64 @@ def _evaluate_group(
                 n_folds=n_folds,
                 min_trades=min_trades,
                 min_positive_folds=min_positive_folds,
+                baseline_ref=baseline_ref,
+                regime_gate_enabled=regime_gate_enabled,
+                regime_chop_min_confidence=regime_chop_min_confidence,
             )
         )
     return out
+
+
+def _parse_iso_utc(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(UTC)
+
+
+def _load_regime_series() -> tuple[list[datetime], list[str]]:
+    root = Path("data/processed/mt5/BTCUSD/regime")
+    files = sorted(root.glob("regime_features_*.parquet"))
+    if not files:
+        return [], []
+    rows = pq.read_table(files[-1]).to_pylist()
+    pairs: list[tuple[datetime, str]] = []
+    for r in rows:
+        ts = str(r.get("ts_open", ""))
+        if not ts:
+            continue
+        try:
+            dt = _parse_iso_utc(ts)
+        except ValueError:
+            continue
+        pairs.append((dt, str(r.get("regime_label", "unknown"))))
+    pairs.sort(key=lambda x: x[0])
+    if not pairs:
+        return [], []
+    times = [p[0] for p in pairs]
+    labels = [p[1] for p in pairs]
+    return times, labels
+
+
+def _attach_regime_labels(
+    dataset: dict[str, Any],
+    regime_times: list[datetime],
+    regime_labels: list[str],
+) -> None:
+    if not regime_times:
+        return
+    labeled_rows = dataset.get("labeled_rows", [])
+    first_label = regime_labels[0]
+    for row in labeled_rows:
+        ts = str(row.get("ts_receive", ""))
+        try:
+            event_dt = _parse_iso_utc(ts)
+        except ValueError:
+            row["regime_label"] = "unknown"
+            continue
+        idx = bisect_right(regime_times, event_dt) - 1
+        if idx < 0:
+            # Event happened before first available MT5 regime candle.
+            row["regime_label"] = first_label
+        else:
+            row["regime_label"] = regime_labels[idx]
 
 
 def run_xgb_clean_search(
@@ -159,6 +314,9 @@ def run_xgb_clean_search(
     cache_dir = Path("data/features/binance/BTCBRL/xgb_clean_cache")
     cache_dir.mkdir(parents=True, exist_ok=True)
     rng = Random(cfg.seed)
+    regime_times, regime_labels = _load_regime_series() if cfg.regime_gate else ([], [])
+    if cfg.regime_gate:
+        print(f"[xgb_clean] regime gate enabled. regime_points={len(regime_times)}")
 
     xgb_n_jobs = 1 if cfg.workers > 1 else 4
     # Keep dataset regimes limited to maximize cache reuse and reduce expensive feature rebuilding.
@@ -191,6 +349,8 @@ def run_xgb_clean_search(
 
     print(f"[xgb_clean] dataset groups: {len(groups)} for {len(candidates)} candidates")
     dataset_by_key: dict[tuple[int, float, int], dict[str, Any]] = {}
+    baseline_by_key: dict[tuple[int, float, int], list[dict[str, Any]]] = {}
+    baseline_ref_by_key: dict[tuple[int, float, int], dict[str, Any]] = {}
     for key, _group in groups.items():
         h, m, s = key
         key_name = f"h{h}_m{str(m).replace('.', '_')}_s{s}"
@@ -205,6 +365,8 @@ def run_xgb_clean_search(
                 "feature_rows": feature_rows,
                 "labeled_rows": labeled_rows,
             }
+            if cfg.regime_gate:
+                _attach_regime_labels(dataset_by_key[key], regime_times, regime_labels)
             print(f"[xgb_clean] cache hit: {key_name} rows={len(labeled_rows)}")
             continue
         dataset = build_paper_aligned_dataset(
@@ -217,13 +379,58 @@ def run_xgb_clean_search(
         pq.write_table(pa.Table.from_pylist(dataset["feature_rows"]), feature_cache_path)
         pq.write_table(pa.Table.from_pylist(dataset["labeled_rows"]), label_cache_path)
         dataset_by_key[key] = dataset
+        if cfg.regime_gate:
+            _attach_regime_labels(dataset_by_key[key], regime_times, regime_labels)
         print(f"[xgb_clean] cache build: {key_name} rows={len(dataset['labeled_rows'])}")
+        baselines = _evaluate_baselines(
+            output_dir=output_dir,
+            dataset=dataset_by_key[key],
+            dataset_key=key_name,
+            horizon_steps=h,
+            sample_every_updates=s,
+            n_folds=cfg.n_folds,
+            regime_gate_enabled=cfg.regime_gate,
+            regime_chop_min_confidence=cfg.regime_chop_min_confidence,
+        )
+        baseline_by_key[key] = baselines
+        baseline_ref_by_key[key] = _best_baseline(baselines)
+        ref = baseline_ref_by_key[key]
+        print(
+            f"[xgb_clean] baseline_ref {key_name}: {ref['name']} "
+            f"pnl_brl={float(ref['summary'].get('mean_pnl_net_brl', 0.0)):.2f} "
+            f"stability={float(ref['stability'].get('positive_ratio', 0.0)):.2f}"
+        )
+
+    for key, ds in dataset_by_key.items():
+        if key in baseline_by_key:
+            continue
+        h, m, s = key
+        key_name = f"h{h}_m{str(m).replace('.', '_')}_s{s}"
+        baselines = _evaluate_baselines(
+            output_dir=output_dir,
+            dataset=ds,
+            dataset_key=key_name,
+            horizon_steps=h,
+            sample_every_updates=s,
+            n_folds=cfg.n_folds,
+            regime_gate_enabled=cfg.regime_gate,
+            regime_chop_min_confidence=cfg.regime_chop_min_confidence,
+        )
+        baseline_by_key[key] = baselines
+        baseline_ref_by_key[key] = _best_baseline(baselines)
+        ref = baseline_ref_by_key[key]
+        print(
+            f"[xgb_clean] baseline_ref {key_name}: {ref['name']} "
+            f"pnl_brl={float(ref['summary'].get('mean_pnl_net_brl', 0.0)):.2f} "
+            f"stability={float(ref['stability'].get('positive_ratio', 0.0)):.2f}"
+        )
 
     if cfg.workers <= 1:
         for key, group in groups.items():
             h, m, s_upd = key
             key_name = f"h{h}_m{str(m).replace('.', '_')}_s{s_upd}"
             ds = dataset_by_key[key]
+            baseline_ref = baseline_ref_by_key[key]
             for candidate in group:
                 entry = _evaluate_candidate(
                     candidate,
@@ -234,6 +441,9 @@ def run_xgb_clean_search(
                     n_folds=cfg.n_folds,
                     min_trades=cfg.min_trades,
                     min_positive_folds=cfg.min_positive_folds,
+                    baseline_ref=baseline_ref,
+                    regime_gate_enabled=cfg.regime_gate,
+                    regime_chop_min_confidence=cfg.regime_chop_min_confidence,
                 )
                 entries.append(entry)
                 s = entry["summary"]
@@ -249,6 +459,7 @@ def run_xgb_clean_search(
                 h, m, s_upd = key
                 key_name = f"h{h}_m{str(m).replace('.', '_')}_s{s_upd}"
                 ds = dataset_by_key[key]
+                baseline_ref = baseline_ref_by_key[key]
                 fut = ex.submit(
                     _evaluate_group,
                     candidates=group,
@@ -259,6 +470,9 @@ def run_xgb_clean_search(
                     n_folds=cfg.n_folds,
                     min_trades=cfg.min_trades,
                     min_positive_folds=cfg.min_positive_folds,
+                    baseline_ref=baseline_ref,
+                    regime_gate_enabled=cfg.regime_gate,
+                    regime_chop_min_confidence=cfg.regime_chop_min_confidence,
                 )
                 futures[fut] = key_name
             for fut in as_completed(futures):
@@ -274,6 +488,10 @@ def run_xgb_clean_search(
 
     entries.sort(key=lambda x: float(x["score"]), reverse=True)
     champion = entries[0] if entries else None
+    promoted = [e for e in entries if bool(e.get("gate", {}).get("promote", False))]
+    promoted_champion = promoted[0] if promoted else None
+    winners = [e for e in entries if float(e["summary"].get("mean_pnl_net_brl", 0.0)) > 0.0]
+    winners.sort(key=lambda x: float(x["summary"]["mean_pnl_net_brl"]), reverse=True)
     payload = {
         "generated_at_utc": datetime.now(UTC).isoformat(),
         "search_config": {
@@ -283,13 +501,57 @@ def run_xgb_clean_search(
             "min_positive_folds": cfg.min_positive_folds,
             "seed": cfg.seed,
             "workers": cfg.workers,
+            "regime_gate": cfg.regime_gate,
+            "regime_chop_min_confidence": cfg.regime_chop_min_confidence,
         },
         "entries": entries,
         "champion": champion,
+        "promoted_count": len(promoted),
+        "promoted_champion": promoted_champion,
+        "winners_count": len(winners),
+        "baselines_by_dataset": {
+            f"h{k[0]}_m{str(k[1]).replace('.', '_')}_s{k[2]}": v for k, v in baseline_by_key.items()
+        },
     }
     (output_dir / "leaderboard.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    if champion:
+    winners_payload = {
+        "generated_at_utc": payload["generated_at_utc"],
+        "filter": "mean_pnl_net_brl > 0",
+        "count": len(winners),
+        "entries": winners,
+        "best": winners[0] if winners else None,
+    }
+    (output_dir / "winners_latest.json").write_text(
+        json.dumps(winners_payload, indent=2), encoding="utf-8"
+    )
+
+    equity_payload: dict[str, Any] = {
+        "generated_at_utc": payload["generated_at_utc"],
+        "source_output_dir": str(output_dir),
+        "selected": None,
+        "summary": {},
+        "fold_equity": [],
+        "fold_trade_samples": [],
+    }
+    selected = promoted_champion or champion
+    if selected:
+        candidate_report_path = output_dir / f"{selected['name']}.json"
+        if candidate_report_path.exists():
+            candidate_report = json.loads(candidate_report_path.read_text(encoding="utf-8"))
+            equity_payload["selected"] = {
+                "name": selected["name"],
+                "promoted": bool(selected is promoted_champion),
+                "params": selected.get("params", {}),
+            }
+            equity_payload["summary"] = candidate_report.get("summary", {})
+            equity_payload["fold_equity"] = candidate_report.get("fold_equity", [])
+            equity_payload["fold_trade_samples"] = candidate_report.get("fold_trade_samples", [])
+    (output_dir / "equity_curve_latest.json").write_text(
+        json.dumps(equity_payload, indent=2), encoding="utf-8"
+    )
+
+    if promoted_champion:
         Path("artifacts/champion_strategy_xgb_clean.json").write_text(
-            json.dumps(champion, indent=2), encoding="utf-8"
+            json.dumps(promoted_champion, indent=2), encoding="utf-8"
         )
     return payload
