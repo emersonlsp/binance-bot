@@ -201,14 +201,14 @@ def _try_close_position(state: dict[str, Any], mid: float, ts: str) -> dict[str,
 def run_forever(poll_seconds: int = 20) -> None:
     load_dotenv()
     champion = _load_champion()
-    out = Path("artifacts/paper_live")
+    out = Path("artifacts/paper_sim")
     state_path = out / "paper_report.json"
     signals_path = out / "signals.jsonl"
     trades_path = out / "trades.jsonl"
     trading = load_trading_params()
     state = _load_state(state_path, trading.risk.paper_bankroll_brl)
     _save_state(state_path, _state_summary(state))
-    print("[paper_live] started", _now_iso(), "bankroll=", state["bankroll_brl"], flush=True)
+    print("[paper_sim] started", _now_iso(), "bankroll=", state["bankroll_brl"], flush=True)
     last_heartbeat = 0.0
     while True:
         try:
@@ -235,11 +235,11 @@ def run_forever(poll_seconds: int = 20) -> None:
                     _append_jsonl(trades_path, closed)
                     summary = _state_summary(state)
                     print(
-                        f"[paper_live] close {closed['side']} {closed['exit_reason']} pnl={closed['pnl_brl']:.2f} bankroll={closed['bankroll_after_brl']:.2f}",
+                        f"[paper_sim] close {closed['side']} {closed['exit_reason']} pnl={closed['pnl_brl']:.2f} bankroll={closed['bankroll_after_brl']:.2f}",
                         flush=True,
                     )
                     print(
-                        f"[paper_live] summary trades={summary['trades_count']} win_rate={summary['win_rate']:.2%} pnl={summary['realized_pnl_brl']:.2f} return={summary['return_pct']:.2%} dd={summary['max_drawdown_brl']:.2f}",
+                        f"[paper_sim] summary trades={summary['trades_count']} win_rate={summary['win_rate']:.2%} pnl={summary['realized_pnl_brl']:.2f} return={summary['return_pct']:.2%} dd={summary['max_drawdown_brl']:.2f}",
                         flush=True,
                     )
                 if state.get("open_position") is None:
@@ -251,16 +251,23 @@ def run_forever(poll_seconds: int = 20) -> None:
                             pos = _open_position(state, sig.action_intent, mid, params, ts)
                             event_happened = True
                             print(
-                                f"[paper_live] open {pos['side']} entry={pos['entry_price']:.2f} sl={pos['stop_loss']:.2f} tp={pos['take_profit']:.2f}",
+                                f"[paper_sim] open {pos['side']} entry={pos['entry_price']:.2f} sl={pos['stop_loss']:.2f} tp={pos['take_profit']:.2f}",
                                 flush=True,
                             )
                 _save_state(state_path, _state_summary(state))
             now = time.time()
             if (not event_happened) and (now - last_heartbeat >= 10.0):
-                print("[paper_live] analisando mercado... sem novo evento", flush=True)
+                open_pos = state.get("open_position")
+                if open_pos is None:
+                    print("[paper_sim] analisando mercado... sem novo evento", flush=True)
+                else:
+                    print(
+                        f"[paper_sim] trade aberta side={open_pos['side']} entry={float(open_pos['entry_price']):.2f} sl={float(open_pos['stop_loss']):.2f} tp={float(open_pos['take_profit']):.2f}",
+                        flush=True,
+                    )
                 last_heartbeat = now
         except Exception as exc:
-            print("[paper_live] cycle_error", str(exc), flush=True)
+            print("[paper_sim] cycle_error", str(exc), flush=True)
         time.sleep(max(5, poll_seconds))
 
 

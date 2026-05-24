@@ -22,16 +22,16 @@ Duplo clique no Windows:
 - execute `start_collector.pyw`
 - logs em `logs/collector_YYYYMMDD.log`
 
-Paper live (simulado, separado do coletor):
+Paper runner (simulado, separado do coletor):
 - execute `start_paper.pyw`
-- artefatos em `artifacts/paper_live/`
+- artefatos em `artifacts/paper_sim/`
   - `paper_report.json` (resumo atual: trades, win rate, pnl, retorno, drawdown)
   - `signals.jsonl`
   - `trades.jsonl`
 
-Reset do paper:
+Reset do paper simulado:
 - pare o `start_paper.pyw`
-- apague `artifacts/paper_live/paper_report.json`
+- apague `artifacts/paper_sim/paper_report.json`
 - inicie o paper novamente
 
 Saída:

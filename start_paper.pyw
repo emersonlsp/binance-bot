@@ -17,7 +17,7 @@ def main() -> None:
     current_pp = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = src_path if not current_pp else f"{src_path};{current_pp}"
 
-    cmd = r".\.venv\Scripts\python.exe -m binance_bot.paper.live_runner"
+    cmd = r".\.venv\Scripts\python.exe -m binance_bot.paper.paper_runner"
     subprocess.Popen(
         ["cmd.exe", "/k", cmd],
         cwd=str(ROOT),
