@@ -109,6 +109,8 @@ def _build_event_time_features(
             continue
         best_bid = top_bids[0][0]
         best_ask = top_asks[0][0]
+        best_bid_size = float(top_bids[0][1])
+        best_ask_size = float(top_asks[0][1])
         spread = best_ask - best_bid
         if spread < 0:
             continue
@@ -119,6 +121,10 @@ def _build_event_time_features(
             "session_id": session_id,
             "mid_price": mid,
             "spread": spread,
+            "bid_price_l1": best_bid,
+            "ask_price_l1": best_ask,
+            "bid_size_l1": best_bid_size,
+            "ask_size_l1": best_ask_size,
             "quality_ok": True,
         }
         mvals: list[float] = []

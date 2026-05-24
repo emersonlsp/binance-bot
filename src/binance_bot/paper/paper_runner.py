@@ -16,6 +16,50 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _parse_iso_utc(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(UTC)
+
+
+def _entry_price_from_book(side: str, mid: float, spread: float) -> float:
+    half = max(0.0, spread / 2.0)
+    best_bid = max(0.0, mid - half)
+    best_ask = mid + half
+    return best_ask if side == "long" else best_bid
+
+
+def _exit_price_from_book(side: str, mid: float, spread: float) -> float:
+    half = max(0.0, spread / 2.0)
+    best_bid = max(0.0, mid - half)
+    best_ask = mid + half
+    # Close long selling at bid; close short buying at ask.
+    return best_bid if side == "long" else best_ask
+
+
+def _best_bid_ask(mid: float, spread: float) -> tuple[float, float]:
+    half = max(0.0, spread / 2.0)
+    best_bid = max(0.0, mid - half)
+    best_ask = mid + half
+    return best_bid, best_ask
+
+
+def _ioc_fills(side: str, limit_price: float, mid: float, spread: float) -> bool:
+    best_bid, best_ask = _best_bid_ask(mid, spread)
+    if side == "long":
+        return limit_price >= best_ask and best_ask > 0
+    if side == "short":
+        return limit_price <= best_bid and best_bid > 0
+    return False
+
+
+def _best_level_size(latest: dict[str, Any], side: str) -> float:
+    key = "ask_size_l1" if side == "long" else "bid_size_l1"
+    raw = latest.get(key, 0.0)
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _load_champion() -> dict[str, Any]:
     p = Path("artifacts/champion_strategy_xgb_clean.json")
     if p.exists():
@@ -135,7 +179,7 @@ def _open_position(state: dict[str, Any], side: str, entry: float, params: dict[
     return pos
 
 
-def _try_close_position(state: dict[str, Any], mid: float, ts: str) -> dict[str, Any] | None:
+def _try_close_position(state: dict[str, Any], mid: float, spread: float, ts: str) -> dict[str, Any] | None:
     pos = state.get("open_position")
     if not pos:
         return None
@@ -145,7 +189,7 @@ def _try_close_position(state: dict[str, Any], mid: float, ts: str) -> dict[str,
     entry = float(pos["entry_price"])
     should_close = False
     exit_reason = ""
-    exit_price = mid
+    exit_price = _exit_price_from_book(side, mid, spread)
     if side == "long":
         if mid <= sl:
             should_close = True
@@ -210,14 +254,27 @@ def run_forever(poll_seconds: int = 20) -> None:
     _save_state(state_path, _state_summary(state))
     print("[paper_sim] started", _now_iso(), "bankroll=", state["bankroll_brl"], flush=True)
     last_heartbeat = 0.0
+    max_feature_age_seconds = 120.0
     while True:
         try:
             event_happened = False
             strategy, latest, params = _build_strategy_and_latest_feature(champion)
             ts = str(latest.get("ts_receive", ""))
             if ts and ts != state.get("last_feature_ts", ""):
+                age_seconds = (datetime.now(UTC) - _parse_iso_utc(ts)).total_seconds()
+                if age_seconds > max_feature_age_seconds:
+                    print(
+                        f"[paper_sim] dado atrasado ({age_seconds:.0f}s). aguardando dado novo...",
+                        flush=True,
+                    )
+                    now = time.time()
+                    if now - last_heartbeat >= 10.0:
+                        last_heartbeat = now
+                    time.sleep(max(5, poll_seconds))
+                    continue
                 state["last_feature_ts"] = ts
                 mid = float(latest.get("mid_price", 0.0))
+                spread = float(latest.get("spread", 0.0))
                 sig = strategy.predict(latest)
                 _append_jsonl(
                     signals_path,
@@ -227,9 +284,10 @@ def run_forever(poll_seconds: int = 20) -> None:
                         "confidence": sig.confidence,
                         "score": sig.signal_score,
                         "mid_price": mid,
+                        "spread": spread,
                     },
                 )
-                closed = _try_close_position(state, mid, ts)
+                closed = _try_close_position(state, mid, spread, ts)
                 if closed is not None:
                     event_happened = True
                     _append_jsonl(trades_path, closed)
@@ -245,15 +303,30 @@ def run_forever(poll_seconds: int = 20) -> None:
                 if state.get("open_position") is None:
                     min_conf = float(params.get("min_signal_confidence", 0.75))
                     max_spread = float(params.get("max_spread_brl", 3.0))
-                    spread = float(latest.get("spread", 0.0))
                     if sig.confidence >= min_conf and spread <= max_spread:
                         if sig.action_intent in ("long", "short"):
-                            pos = _open_position(state, sig.action_intent, mid, params, ts)
-                            event_happened = True
-                            print(
-                                f"[paper_sim] open {pos['side']} entry={pos['entry_price']:.2f} sl={pos['stop_loss']:.2f} tp={pos['take_profit']:.2f}",
-                                flush=True,
-                            )
+                            entry_px = _entry_price_from_book(sig.action_intent, mid, spread)
+                            draft_pos = _open_position(state, sig.action_intent, entry_px, params, ts)
+                            state["open_position"] = None
+                            book_qty = _best_level_size(latest, sig.action_intent)
+                            req_qty = float(draft_pos["qty"])
+                            if _ioc_fills(sig.action_intent, entry_px, mid, spread) and book_qty >= req_qty:
+                                pos = _open_position(state, sig.action_intent, entry_px, params, ts)
+                                event_happened = True
+                                print(
+                                    f"[paper_sim] ioc_filled side={sig.action_intent} limit={entry_px:.2f} mid={mid:.2f} spread={spread:.2f} qty={req_qty:.6f} l1_qty={book_qty:.6f}",
+                                    flush=True,
+                                )
+                                print(
+                                    f"[paper_sim] open {pos['side']} entry={pos['entry_price']:.2f} sl={pos['stop_loss']:.2f} tp={pos['take_profit']:.2f}",
+                                    flush=True,
+                                )
+                            else:
+                                event_happened = True
+                                print(
+                                    f"[paper_sim] ioc_canceled side={sig.action_intent} limit={entry_px:.2f} mid={mid:.2f} spread={spread:.2f} qty={req_qty:.6f} l1_qty={book_qty:.6f}",
+                                    flush=True,
+                                )
                 _save_state(state_path, _state_summary(state))
             now = time.time()
             if (not event_happened) and (now - last_heartbeat >= 10.0):
