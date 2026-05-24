@@ -127,6 +127,15 @@ def _build_event_time_features(
             "ask_size_l1": best_ask_size,
             "quality_ok": True,
         }
+        for i in range(levels):
+            bid_price = float(top_bids[i][0]) if i < len(top_bids) else 0.0
+            bid_size = float(top_bids[i][1]) if i < len(top_bids) else 0.0
+            ask_price = float(top_asks[i][0]) if i < len(top_asks) else 0.0
+            ask_size = float(top_asks[i][1]) if i < len(top_asks) else 0.0
+            out[f"bid_price_l{i+1}"] = bid_price
+            out[f"bid_size_l{i+1}"] = bid_size
+            out[f"ask_price_l{i+1}"] = ask_price
+            out[f"ask_size_l{i+1}"] = ask_size
         mvals: list[float] = []
         for i in range(levels):
             bid_size = top_bids[i][1] if i < len(top_bids) else 0.0

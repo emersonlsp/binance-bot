@@ -60,6 +60,115 @@ def _best_level_size(latest: dict[str, Any], side: str) -> float:
         return 0.0
 
 
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_side_levels(latest: dict[str, Any], side: str, levels: int = 10) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    px_prefix = "ask_price_l" if side == "long" else "bid_price_l"
+    sz_prefix = "ask_size_l" if side == "long" else "bid_size_l"
+    for i in range(1, levels + 1):
+        px = _safe_float(latest.get(f"{px_prefix}{i}"), 0.0)
+        sz = _safe_float(latest.get(f"{sz_prefix}{i}"), 0.0)
+        if px > 0 and sz > 0:
+            out.append((px, sz))
+    return out
+
+
+def _simulate_ioc_multilevel_fill(
+    *,
+    side: str,
+    qty: float,
+    limit_price: float,
+    latest: dict[str, Any],
+    max_walk_bps: float,
+    max_levels: int = 10,
+) -> dict[str, Any]:
+    levels = _build_side_levels(latest, side, levels=max_levels)
+    if not levels or qty <= 0:
+        return {"filled": False, "reason": "no_levels"}
+
+    best_price = levels[0][0]
+    remaining = qty
+    filled_notional = 0.0
+    filled_qty = 0.0
+    worst_price = best_price
+    used_levels = 0
+
+    for price, avail in levels:
+        if remaining <= 0:
+            break
+        if side == "long":
+            crosses_limit = price <= limit_price
+            within_walk = price <= best_price * (1.0 + (max_walk_bps / 10000.0))
+        else:
+            crosses_limit = price >= limit_price
+            within_walk = price >= best_price * (1.0 - (max_walk_bps / 10000.0))
+        if not crosses_limit or not within_walk:
+            break
+
+        take = min(remaining, avail)
+        if take <= 0:
+            continue
+        remaining -= take
+        filled_qty += take
+        filled_notional += take * price
+        worst_price = price
+        used_levels += 1
+
+    if filled_qty < qty or filled_qty <= 0:
+        return {
+            "filled": False,
+            "reason": "insufficient_depth_or_price_walk",
+            "filled_qty": filled_qty,
+            "requested_qty": qty,
+            "best_price": best_price,
+            "worst_price": worst_price,
+            "used_levels": used_levels,
+        }
+
+    avg_price = filled_notional / filled_qty
+    return {
+        "filled": True,
+        "avg_price": avg_price,
+        "filled_qty": filled_qty,
+        "requested_qty": qty,
+        "best_price": best_price,
+        "worst_price": worst_price,
+        "used_levels": used_levels,
+    }
+
+
+def _simulate_ioc_best_price_fill(*, side: str, qty: float, latest: dict[str, Any]) -> dict[str, Any]:
+    levels = _build_side_levels(latest, side, levels=1)
+    if not levels or qty <= 0:
+        return {"filled": False, "reason": "no_levels"}
+    px, avail = levels[0]
+    if avail < qty:
+        return {
+            "filled": False,
+            "reason": "insufficient_l1_depth",
+            "filled_qty": 0.0,
+            "requested_qty": qty,
+            "best_price": px,
+            "worst_price": px,
+            "used_levels": 1,
+        }
+    return {
+        "filled": True,
+        "avg_price": px,
+        "filled_qty": qty,
+        "requested_qty": qty,
+        "best_price": px,
+        "worst_price": px,
+        "used_levels": 1,
+    }
+
+
 def _load_champion() -> dict[str, Any]:
     p = Path("artifacts/champion_strategy_xgb_clean.json")
     if p.exists():
@@ -326,18 +435,36 @@ def run_forever(poll_seconds: int = 20) -> None:
                 if state.get("open_position") is None:
                     min_conf = float(params.get("min_signal_confidence", 0.75))
                     max_spread = float(params.get("max_spread_brl", 3.0))
+                    fill_mode = str(params.get("paper_ioc_fill_mode", "best_price_only")).strip().lower()
+                    max_walk_bps = float(params.get("paper_ioc_max_walk_bps", 2.0))
+                    max_ioc_levels = int(params.get("paper_ioc_max_levels", 5))
                     if sig.confidence >= min_conf and spread <= max_spread:
                         if sig.action_intent in ("long", "short"):
                             entry_px = _entry_price_from_book(sig.action_intent, mid, spread)
                             draft_pos = _open_position(state, sig.action_intent, entry_px, params, ts)
                             state["open_position"] = None
-                            book_qty = _best_level_size(latest, sig.action_intent)
                             req_qty = float(draft_pos["qty"])
-                            if _ioc_fills(sig.action_intent, entry_px, mid, spread) and book_qty >= req_qty:
-                                pos = _open_position(state, sig.action_intent, entry_px, params, ts)
+                            if fill_mode == "multi_level":
+                                fill = _simulate_ioc_multilevel_fill(
+                                    side=sig.action_intent,
+                                    qty=req_qty,
+                                    limit_price=entry_px,
+                                    latest=latest,
+                                    max_walk_bps=max_walk_bps,
+                                    max_levels=max_ioc_levels,
+                                )
+                            else:
+                                fill = _simulate_ioc_best_price_fill(
+                                    side=sig.action_intent,
+                                    qty=req_qty,
+                                    latest=latest,
+                                )
+                            if bool(fill.get("filled", False)):
+                                avg_entry = float(fill.get("avg_price", entry_px))
+                                pos = _open_position(state, sig.action_intent, avg_entry, params, ts)
                                 event_happened = True
                                 print(
-                                    f"[paper_sim] ioc_filled side={sig.action_intent} limit={entry_px:.2f} mid={mid:.2f} spread={spread:.2f} qty={req_qty:.6f} l1_qty={book_qty:.6f}",
+                                    f"[paper_sim] ioc_filled mode={fill_mode} side={sig.action_intent} limit={entry_px:.2f} avg={avg_entry:.2f} best={float(fill.get('best_price', 0.0)):.2f} worst={float(fill.get('worst_price', 0.0)):.2f} levels={int(fill.get('used_levels', 0))} qty={req_qty:.6f}",
                                     flush=True,
                                 )
                                 print(
@@ -347,7 +474,7 @@ def run_forever(poll_seconds: int = 20) -> None:
                             else:
                                 event_happened = True
                                 print(
-                                    f"[paper_sim] ioc_canceled side={sig.action_intent} limit={entry_px:.2f} mid={mid:.2f} spread={spread:.2f} qty={req_qty:.6f} l1_qty={book_qty:.6f}",
+                                    f"[paper_sim] ioc_canceled mode={fill_mode} side={sig.action_intent} limit={entry_px:.2f} mid={mid:.2f} spread={spread:.2f} qty={req_qty:.6f} filled={float(fill.get('filled_qty', 0.0)):.6f} reason={fill.get('reason', 'unknown')}",
                                     flush=True,
                                 )
                 _save_state(state_path, _state_summary(state))
