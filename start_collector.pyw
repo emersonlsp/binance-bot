@@ -13,9 +13,8 @@ def main() -> None:
     if not VENV_PYTHON.exists():
         return
 
-    cmd = f'"{VENV_PYTHON}" "{RUNNER}"'
     subprocess.Popen(
-        ["cmd.exe", "/k", cmd],
+        [str(VENV_PYTHON), str(RUNNER)],
         cwd=str(ROOT),
         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
     )
