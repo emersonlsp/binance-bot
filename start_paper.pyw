@@ -16,9 +16,8 @@ def main() -> None:
     current_pp = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = src_path if not current_pp else f"{src_path};{current_pp}"
 
-    cmd = f'"{VENV_PYTHON}" -m binance_bot.paper.live_runner'
     subprocess.Popen(
-        ["cmd.exe", "/k", cmd],
+        [str(VENV_PYTHON), "-m", "binance_bot.paper.live_runner"],
         cwd=str(ROOT),
         env=env,
         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
