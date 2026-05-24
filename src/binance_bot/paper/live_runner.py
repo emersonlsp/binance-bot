@@ -209,8 +209,10 @@ def run_forever(poll_seconds: int = 20) -> None:
     state = _load_state(state_path, trading.risk.paper_bankroll_brl)
     _save_state(state_path, _state_summary(state))
     print("[paper_live] started", _now_iso(), "bankroll=", state["bankroll_brl"], flush=True)
+    last_heartbeat = 0.0
     while True:
         try:
+            event_happened = False
             strategy, latest, params = _build_strategy_and_latest_feature(champion)
             ts = str(latest.get("ts_receive", ""))
             if ts and ts != state.get("last_feature_ts", ""):
@@ -229,6 +231,7 @@ def run_forever(poll_seconds: int = 20) -> None:
                 )
                 closed = _try_close_position(state, mid, ts)
                 if closed is not None:
+                    event_happened = True
                     _append_jsonl(trades_path, closed)
                     summary = _state_summary(state)
                     print(
@@ -246,11 +249,16 @@ def run_forever(poll_seconds: int = 20) -> None:
                     if sig.confidence >= min_conf and spread <= max_spread:
                         if sig.action_intent in ("long", "short"):
                             pos = _open_position(state, sig.action_intent, mid, params, ts)
+                            event_happened = True
                             print(
                                 f"[paper_live] open {pos['side']} entry={pos['entry_price']:.2f} sl={pos['stop_loss']:.2f} tp={pos['take_profit']:.2f}",
                                 flush=True,
                             )
                 _save_state(state_path, _state_summary(state))
+            now = time.time()
+            if (not event_happened) and (now - last_heartbeat >= 10.0):
+                print("[paper_live] analisando mercado... sem novo evento", flush=True)
+                last_heartbeat = now
         except Exception as exc:
             print("[paper_live] cycle_error", str(exc), flush=True)
         time.sleep(max(5, poll_seconds))
