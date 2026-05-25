@@ -27,6 +27,30 @@ class SearchConfig:
     regime_gate: bool = False
     regime_chop_min_confidence: float = 0.78
     xgb_device: str = "cpu"
+    embargo_gap_steps: int = 0
+    entry_latency_steps: int = 0
+    allow_partial_fill: bool = True
+    min_fill_ratio: float = 0.1
+
+
+def _dir_fingerprint(root: Path) -> dict[str, int]:
+    files = sorted(root.rglob("*.parquet"))
+    count = 0
+    size_sum = 0
+    mtime_max = 0
+    for f in files:
+        st = f.stat()
+        count += 1
+        size_sum += int(st.st_size)
+        mtime_max = max(mtime_max, int(st.st_mtime_ns))
+    return {"files": count, "size_sum": size_sum, "mtime_max_ns": mtime_max}
+
+
+def _raw_data_fingerprint(raw_root: Path) -> dict[str, dict[str, int]]:
+    return {
+        "updates": _dir_fingerprint(raw_root / "updates"),
+        "collector_logs": _dir_fingerprint(raw_root / "collector_logs"),
+    }
 
 
 def _champion_sort_key(entry: dict[str, Any]) -> tuple[float, float, float]:
@@ -126,6 +150,10 @@ def _evaluate_existing_champion_on_current_data(
         baseline_ref=baseline_ref,
         regime_gate_enabled=cfg.regime_gate,
         regime_chop_min_confidence=cfg.regime_chop_min_confidence,
+        embargo_gap_steps=cfg.embargo_gap_steps,
+        entry_latency_steps=cfg.entry_latency_steps,
+        allow_partial_fill=cfg.allow_partial_fill,
+        min_fill_ratio=cfg.min_fill_ratio,
     )
     return entry
 
@@ -141,20 +169,47 @@ def _sample_candidate(
     horizon_steps, move_threshold_bps, sample_every_updates = data_profile
     min_signal_confidence = rng.choice([0.60, 0.65, 0.70, 0.75, 0.80, 0.85])
     max_spread_brl = rng.choice([1.5, 2.0, 2.5, 3.0, 4.0])
-    strategy_kwargs = {
-        "n_estimators": rng.choice([200, 250, 300, 400, 500]),
-        "max_depth": rng.choice([3, 4, 5, 6]),
-        "learning_rate": rng.choice([0.02, 0.03, 0.04, 0.05]),
-        "subsample": rng.choice([0.8, 0.9, 1.0]),
-        "colsample_bytree": rng.choice([0.8, 0.9, 1.0]),
-        "reg_lambda": rng.choice([0.5, 1.0, 2.0, 5.0]),
-        "min_confidence": rng.choice([0.55, 0.60, 0.65, 0.70]),
-        "n_jobs": xgb_n_jobs,
-        "xgb_device": xgb_device,
-    }
+    seq_pick = rng.random()
+    if seq_pick < 0.10:
+        strategy_name = "mlofi_seq_gru_v1"
+        strategy_kwargs = {
+            "hidden_size": rng.choice([16, 24, 32]),
+            "num_layers": rng.choice([1, 2]),
+            "dropout": rng.choice([0.0, 0.1]),
+            "epochs": rng.choice([6, 8, 10]),
+            "batch_size": rng.choice([128, 256, 384]),
+            "learning_rate": rng.choice([5.0e-4, 1.0e-3, 2.0e-3]),
+            "weight_decay": rng.choice([1.0e-6, 1.0e-5, 1.0e-4]),
+            "min_confidence": rng.choice([0.55, 0.60, 0.65, 0.70]),
+            "random_state": 42,
+            "seq_len": 8,
+        }
+    elif seq_pick < 0.20:
+        strategy_name = "mlofi_seq_mlp_v1"
+        strategy_kwargs = {
+            "hidden_layer_sizes": rng.choice([(64, 32), (128, 64), (128, 32)]),
+            "alpha": rng.choice([1.0e-4, 5.0e-4, 1.0e-3]),
+            "learning_rate_init": rng.choice([5.0e-4, 1.0e-3, 2.0e-3]),
+            "max_iter": rng.choice([150, 200, 300]),
+            "min_confidence": rng.choice([0.55, 0.60, 0.65, 0.70]),
+            "random_state": 42,
+        }
+    else:
+        strategy_name = "mlofi_xgb_v1"
+        strategy_kwargs = {
+            "n_estimators": rng.choice([200, 250, 300, 400, 500]),
+            "max_depth": rng.choice([3, 4, 5, 6]),
+            "learning_rate": rng.choice([0.02, 0.03, 0.04, 0.05]),
+            "subsample": rng.choice([0.8, 0.9, 1.0]),
+            "colsample_bytree": rng.choice([0.8, 0.9, 1.0]),
+            "reg_lambda": rng.choice([0.5, 1.0, 2.0, 5.0]),
+            "min_confidence": rng.choice([0.55, 0.60, 0.65, 0.70]),
+            "n_jobs": xgb_n_jobs,
+            "xgb_device": xgb_device,
+        }
     return {
         "name": f"xgb_clean_{idx:03d}",
-        "strategy_name": "mlofi_xgb_v1",
+        "strategy_name": strategy_name,
         "strategy_kwargs": strategy_kwargs,
         "horizon_steps": horizon_steps,
         "move_threshold_bps": move_threshold_bps,
@@ -205,6 +260,10 @@ def _evaluate_baselines(
     n_folds: int,
     regime_gate_enabled: bool,
     regime_chop_min_confidence: float,
+    embargo_gap_steps: int,
+    entry_latency_steps: int,
+    allow_partial_fill: bool,
+    min_fill_ratio: float,
 ) -> list[dict[str, Any]]:
     specs = [
         ("baseline_no_trade_v1", {}, 0.0, 1.0e12),
@@ -225,6 +284,10 @@ def _evaluate_baselines(
             max_spread_brl=max_spread,
             regime_gate_enabled=regime_gate_enabled,
             regime_chop_min_confidence=regime_chop_min_confidence,
+            embargo_gap_steps=embargo_gap_steps,
+            entry_latency_steps=entry_latency_steps,
+            allow_partial_fill=allow_partial_fill,
+            min_fill_ratio=min_fill_ratio,
         )
         stability = _fold_stability(report.get("folds_brl", []))
         out.append(
@@ -269,6 +332,10 @@ def _evaluate_candidate(
     baseline_ref: dict[str, Any],
     regime_gate_enabled: bool,
     regime_chop_min_confidence: float,
+    embargo_gap_steps: int,
+    entry_latency_steps: int,
+    allow_partial_fill: bool,
+    min_fill_ratio: float,
 ) -> dict[str, Any]:
     report = run_paper_aligned_training_from_dataset(
         dataset=dataset,
@@ -283,6 +350,10 @@ def _evaluate_candidate(
         max_spread_brl=float(candidate["max_spread_brl"]),
         regime_gate_enabled=regime_gate_enabled,
         regime_chop_min_confidence=regime_chop_min_confidence,
+        embargo_gap_steps=embargo_gap_steps,
+        entry_latency_steps=entry_latency_steps,
+        allow_partial_fill=allow_partial_fill,
+        min_fill_ratio=min_fill_ratio,
     )
     entry = {
         "name": candidate["name"],
@@ -339,6 +410,10 @@ def _evaluate_group(
     baseline_ref: dict[str, Any],
     regime_gate_enabled: bool,
     regime_chop_min_confidence: float,
+    embargo_gap_steps: int,
+    entry_latency_steps: int,
+    allow_partial_fill: bool,
+    min_fill_ratio: float,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -356,6 +431,10 @@ def _evaluate_group(
                 baseline_ref=baseline_ref,
                 regime_gate_enabled=regime_gate_enabled,
                 regime_chop_min_confidence=regime_chop_min_confidence,
+                embargo_gap_steps=embargo_gap_steps,
+                entry_latency_steps=entry_latency_steps,
+                allow_partial_fill=allow_partial_fill,
+                min_fill_ratio=min_fill_ratio,
             )
         )
     return out
@@ -423,6 +502,7 @@ def run_xgb_clean_search(
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = Path("data/features/binance/BTCBRL/xgb_clean_cache")
     cache_dir.mkdir(parents=True, exist_ok=True)
+    raw_fp = _raw_data_fingerprint(raw_root)
     rng = Random(cfg.seed)
     regime_times, regime_labels = _load_regime_series() if cfg.regime_gate else ([], [])
     if cfg.regime_gate:
@@ -471,7 +551,15 @@ def run_xgb_clean_search(
         key_name = f"h{h}_m{str(m).replace('.', '_')}_s{s}"
         feature_cache_path = cache_dir / f"{key_name}_features.parquet"
         label_cache_path = cache_dir / f"{key_name}_labeled.parquet"
-        if feature_cache_path.exists() and label_cache_path.exists():
+        meta_cache_path = cache_dir / f"{key_name}_meta.json"
+        cache_valid = False
+        if feature_cache_path.exists() and label_cache_path.exists() and meta_cache_path.exists():
+            try:
+                meta = json.loads(meta_cache_path.read_text(encoding="utf-8"))
+                cache_valid = meta.get("raw_fingerprint") == raw_fp
+            except Exception:
+                cache_valid = False
+        if cache_valid:
             feature_rows = pq.read_table(feature_cache_path).to_pylist()
             labeled_rows = pq.read_table(label_cache_path).to_pylist()
             dataset_by_key[key] = {
@@ -494,6 +582,19 @@ def run_xgb_clean_search(
         )
         pq.write_table(pa.Table.from_pylist(dataset["feature_rows"]), feature_cache_path)
         pq.write_table(pa.Table.from_pylist(dataset["labeled_rows"]), label_cache_path)
+        meta_cache_path.write_text(
+            json.dumps(
+                {
+                    "generated_at_utc": datetime.now(UTC).isoformat(),
+                    "dataset_key": key_name,
+                    "raw_fingerprint": raw_fp,
+                    "rows_features": len(dataset["feature_rows"]),
+                    "rows_labeled": len(dataset["labeled_rows"]),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         dataset_by_key[key] = dataset
         if cfg.regime_gate:
             _attach_regime_labels(dataset_by_key[key], regime_times, regime_labels)
@@ -508,6 +609,10 @@ def run_xgb_clean_search(
             n_folds=cfg.n_folds,
             regime_gate_enabled=cfg.regime_gate,
             regime_chop_min_confidence=cfg.regime_chop_min_confidence,
+            embargo_gap_steps=cfg.embargo_gap_steps,
+            entry_latency_steps=cfg.entry_latency_steps,
+            allow_partial_fill=cfg.allow_partial_fill,
+            min_fill_ratio=cfg.min_fill_ratio,
         )
         baseline_by_key[key] = baselines
         baseline_ref_by_key[key] = _best_baseline(baselines)
@@ -533,6 +638,10 @@ def run_xgb_clean_search(
             n_folds=cfg.n_folds,
             regime_gate_enabled=cfg.regime_gate,
             regime_chop_min_confidence=cfg.regime_chop_min_confidence,
+            embargo_gap_steps=cfg.embargo_gap_steps,
+            entry_latency_steps=cfg.entry_latency_steps,
+            allow_partial_fill=cfg.allow_partial_fill,
+            min_fill_ratio=cfg.min_fill_ratio,
         )
         baseline_by_key[key] = baselines
         baseline_ref_by_key[key] = _best_baseline(baselines)
@@ -563,6 +672,10 @@ def run_xgb_clean_search(
                     baseline_ref=baseline_ref,
                     regime_gate_enabled=cfg.regime_gate,
                     regime_chop_min_confidence=cfg.regime_chop_min_confidence,
+                    embargo_gap_steps=cfg.embargo_gap_steps,
+                    entry_latency_steps=cfg.entry_latency_steps,
+                    allow_partial_fill=cfg.allow_partial_fill,
+                    min_fill_ratio=cfg.min_fill_ratio,
                 )
                 entries.append(entry)
                 s = entry["summary"]
@@ -596,6 +709,10 @@ def run_xgb_clean_search(
                         baseline_ref=baseline_ref,
                         regime_gate_enabled=cfg.regime_gate,
                         regime_chop_min_confidence=cfg.regime_chop_min_confidence,
+                        embargo_gap_steps=cfg.embargo_gap_steps,
+                        entry_latency_steps=cfg.entry_latency_steps,
+                        allow_partial_fill=cfg.allow_partial_fill,
+                        min_fill_ratio=cfg.min_fill_ratio,
                     )
                     futures[fut] = candidate["name"]
             for fut in as_completed(futures):
@@ -627,6 +744,10 @@ def run_xgb_clean_search(
             "workers": cfg.workers,
             "regime_gate": cfg.regime_gate,
             "regime_chop_min_confidence": cfg.regime_chop_min_confidence,
+            "embargo_gap_steps": cfg.embargo_gap_steps,
+            "entry_latency_steps": cfg.entry_latency_steps,
+            "allow_partial_fill": cfg.allow_partial_fill,
+            "min_fill_ratio": cfg.min_fill_ratio,
         },
         "entries": entries,
         "champion": champion,

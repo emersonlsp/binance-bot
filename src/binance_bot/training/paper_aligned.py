@@ -186,6 +186,8 @@ def _build_event_time_features(
     out_rows: list[dict[str, Any]] = []
     step = 0
     active_session: str | None = None
+    seq_window = 8
+    lag_history: list[dict[str, float]] = []
 
     for row in rows_sorted:
         session_id = str(row.get("session_id", "unknown"))
@@ -196,6 +198,7 @@ def _build_event_time_features(
             bid_book.clear()
             ask_book.clear()
             step = 0
+            lag_history.clear()
             active_session = session_id
         side = str(row.get("side", ""))
         price = row.get("price")
@@ -269,7 +272,18 @@ def _build_event_time_features(
             out[f"mlofi_l{i+1}"] = imbalance
             mvals.append(imbalance)
         out["mlofi_score"] = sum(mvals) / len(mvals)
+        for lag in range(1, seq_window + 1):
+            if len(lag_history) >= lag:
+                prev = lag_history[-lag]
+                out[f"mlofi_score_lag{lag}"] = float(prev.get("mlofi_score", 0.0))
+                out[f"spread_lag{lag}"] = float(prev.get("spread", 0.0))
+            else:
+                out[f"mlofi_score_lag{lag}"] = 0.0
+                out[f"spread_lag{lag}"] = 0.0
         out_rows.append(out)
+        lag_history.append({"mlofi_score": float(out["mlofi_score"]), "spread": float(out["spread"])})
+        if len(lag_history) > seq_window:
+            lag_history = lag_history[-seq_window:]
     return out_rows
 
 
@@ -306,16 +320,19 @@ class FoldResult:
     trades: int
 
 
-def _walk_forward_splits(n: int, n_folds: int) -> list[tuple[int, int, int]]:
+def _walk_forward_splits(
+    n: int, n_folds: int, embargo_gap_steps: int
+) -> list[tuple[int, int, int, int]]:
     min_train = max(300, n // 3)
     test_size = max(100, (n - min_train) // max(1, n_folds))
-    splits: list[tuple[int, int, int]] = []
+    splits: list[tuple[int, int, int, int]] = []
     train_end = min_train
     for _ in range(n_folds):
-        test_end = min(n, train_end + test_size)
-        if test_end <= train_end:
+        test_start = min(n, train_end + max(0, embargo_gap_steps))
+        test_end = min(n, test_start + test_size)
+        if test_end <= test_start:
             break
-        splits.append((0, train_end, test_end))
+        splits.append((0, train_end, test_start, test_end))
         train_end = test_end
     return splits
 
@@ -324,7 +341,51 @@ def _accuracy(y_true: list[int], y_pred: list[int]) -> float:
     return (sum(1 for a, b in zip(y_true, y_pred) if a == b) / len(y_true)) if y_true else 0.0
 
 
-def _simulate_trade_ret(
+def _entry_exit_prices(row: dict[str, Any], side: int) -> tuple[float, float, float]:
+    mid = float(row.get("mid_price", 0.0))
+    bid = float(row.get("bid_price_l1", mid))
+    ask = float(row.get("ask_price_l1", mid))
+    if side == 1:
+        return ask, bid, mid
+    return bid, ask, mid
+
+
+def _consume_book_levels(
+    *,
+    row: dict[str, Any],
+    side: int,
+    requested_qty: float,
+    max_levels: int = 10,
+) -> tuple[float, float, float]:
+    # side=1 (long) consumes asks; side=-1 (short) consumes bids.
+    if requested_qty <= 0:
+        return 0.0, 0.0, 0.0
+    remaining = requested_qty
+    filled = 0.0
+    notional = 0.0
+    for lvl in range(1, max_levels + 1):
+        if side == 1:
+            px = float(row.get(f"ask_price_l{lvl}", 0.0))
+            sz = float(row.get(f"ask_size_l{lvl}", 0.0))
+        else:
+            px = float(row.get(f"bid_price_l{lvl}", 0.0))
+            sz = float(row.get(f"bid_size_l{lvl}", 0.0))
+        if px <= 0 or sz <= 0:
+            continue
+        take = min(remaining, sz)
+        if take <= 0:
+            continue
+        filled += take
+        notional += take * px
+        remaining -= take
+        if remaining <= 1.0e-12:
+            break
+    avg_px = (notional / filled) if filled > 0 else 0.0
+    fill_ratio = filled / requested_qty if requested_qty > 0 else 0.0
+    return filled, fill_ratio, avg_px
+
+
+def _simulate_trade_outcome(
     *,
     all_rows: list[dict[str, Any]],
     row_idx: int,
@@ -337,12 +398,34 @@ def _simulate_trade_ret(
     trailing_distance_rr: float,
     trailing_lock_breakeven: bool,
     disable_take_profit_when_trailing: bool,
-) -> float:
-    now = all_rows[row_idx]
-    entry = float(now["mid_price"])
-    if entry <= 0:
-        return 0.0
+    requested_qty: float,
+    latency_steps: int,
+    allow_partial_fill: bool,
+    min_fill_ratio: float,
+) -> dict[str, float | int]:
+    if requested_qty <= 0:
+        return {"filled": 0.0, "fill_ratio": 0.0, "trade_ret": 0.0, "slippage_bps": 0.0}
+    entry_i = row_idx + max(0, latency_steps)
+    if entry_i >= len(all_rows):
+        return {"filled": 0.0, "fill_ratio": 0.0, "trade_ret": 0.0, "slippage_bps": 0.0}
+    now = all_rows[entry_i]
+    entry_ref = all_rows[row_idx]
     session_id = str(now.get("session_id", ""))
+    ref_session = str(entry_ref.get("session_id", ""))
+    if session_id != ref_session:
+        return {"filled": 0.0, "fill_ratio": 0.0, "trade_ret": 0.0, "slippage_bps": 0.0}
+
+    _, exit_touch_px, entry_mid = _entry_exit_prices(now, side)
+    filled_qty, fill_ratio, entry_px = _consume_book_levels(
+        row=now, side=side, requested_qty=requested_qty, max_levels=10
+    )
+    if (not allow_partial_fill and fill_ratio < 1.0) or fill_ratio < min_fill_ratio:
+        return {"filled": 0.0, "fill_ratio": fill_ratio, "trade_ret": 0.0, "slippage_bps": 0.0}
+    filled = 1.0 if filled_qty > 0 else 0.0
+
+    entry = float(entry_px)
+    if entry <= 0:
+        return {"filled": 0.0, "fill_ratio": 0.0, "trade_ret": 0.0, "slippage_bps": 0.0}
     is_long = side == 1
     if is_long:
         stop = entry * (1.0 - stop_loss_pct)
@@ -353,16 +436,17 @@ def _simulate_trade_ret(
     initial_stop = stop
     best_price = entry
     trailing_active = False
-
-    max_j = min(len(all_rows) - 1, row_idx + horizon_steps)
-    exit_price = entry
-    for j in range(row_idx + 1, max_j + 1):
+    max_j = min(len(all_rows) - 1, entry_i + horizon_steps)
+    exit_price = exit_touch_px
+    for j in range(entry_i + 1, max_j + 1):
         row = all_rows[j]
         if str(row.get("session_id", "")) != session_id:
             break
         px = float(row["mid_price"])
-        exit_price = px
-
+        bid = float(row.get("bid_price_l1", px))
+        ask = float(row.get("ask_price_l1", px))
+        touch = bid if is_long else ask
+        exit_price = touch
         if is_long:
             best_price = max(best_price, px)
             risk_per_unit = max(1.0e-12, entry - initial_stop)
@@ -371,14 +455,8 @@ def _simulate_trade_ret(
             best_price = min(best_price, px)
             risk_per_unit = max(1.0e-12, initial_stop - entry)
             favorable_move = entry - best_price
-
-        if (
-            trailing_enabled
-            and not trailing_active
-            and favorable_move >= (trailing_activation_rr * risk_per_unit)
-        ):
+        if trailing_enabled and (not trailing_active) and favorable_move >= (trailing_activation_rr * risk_per_unit):
             trailing_active = True
-
         if trailing_enabled and trailing_active:
             if is_long:
                 candidate_stop = best_price - (trailing_distance_rr * risk_per_unit)
@@ -390,25 +468,30 @@ def _simulate_trade_ret(
                 stop = min(stop, candidate_stop)
                 if trailing_lock_breakeven:
                     stop = min(stop, entry)
-
         if is_long:
-            if px <= stop:
+            if bid <= stop:
                 exit_price = stop
                 break
-            if (not trailing_active or not disable_take_profit_when_trailing) and px >= take_profit:
+            if (not trailing_active or not disable_take_profit_when_trailing) and bid >= take_profit:
                 exit_price = take_profit
                 break
         else:
-            if px >= stop:
+            if ask >= stop:
                 exit_price = stop
                 break
-            if (not trailing_active or not disable_take_profit_when_trailing) and px <= take_profit:
+            if (not trailing_active or not disable_take_profit_when_trailing) and ask <= take_profit:
                 exit_price = take_profit
                 break
-
-    if is_long:
-        return (exit_price - entry) / entry
-    return (entry - exit_price) / entry
+    trade_ret = ((exit_price - entry) / entry) if is_long else ((entry - exit_price) / entry)
+    slippage_bps = 0.0
+    if entry_mid > 0:
+        slippage_bps = (((entry - entry_mid) / entry_mid) * 10000.0) if is_long else (((entry_mid - entry) / entry_mid) * 10000.0)
+    return {
+        "filled": filled,
+        "fill_ratio": fill_ratio,
+        "trade_ret": trade_ret,
+        "slippage_bps": slippage_bps,
+    }
 
 
 def _pnl_net(
@@ -425,17 +508,27 @@ def _pnl_net(
     trailing_distance_rr: float,
     trailing_lock_breakeven: bool,
     disable_take_profit_when_trailing: bool,
-) -> tuple[float, int]:
+    entry_latency_steps: int,
+    allow_partial_fill: bool,
+    min_fill_ratio: float,
+) -> tuple[float, int, dict[str, float]]:
     cost = 2.0 * (cost_bps_side / 10000.0)
     pnl = 0.0
     trades = 0
+    attempted = 0
+    filled = 0
+    partial = 0
+    canceled = 0
+    slippage_sum = 0.0
+    slippage_n = 0
     for row, p in zip(rows, preds):
         if p == 0:
             continue
+        attempted += 1
         row_idx = int(row.get("row_idx", -1))
         if row_idx < 0:
             continue
-        trade_ret = _simulate_trade_ret(
+        out = _simulate_trade_outcome(
             all_rows=all_rows,
             row_idx=row_idx,
             side=p,
@@ -447,10 +540,33 @@ def _pnl_net(
             trailing_distance_rr=trailing_distance_rr,
             trailing_lock_breakeven=trailing_lock_breakeven,
             disable_take_profit_when_trailing=disable_take_profit_when_trailing,
+            requested_qty=1.0,
+            latency_steps=entry_latency_steps,
+            allow_partial_fill=allow_partial_fill,
+            min_fill_ratio=min_fill_ratio,
         )
-        pnl += trade_ret - cost
+        if float(out.get("filled", 0.0)) <= 0:
+            canceled += 1
+            continue
+        fr = float(out.get("fill_ratio", 0.0))
+        if fr < 1.0:
+            partial += 1
+        filled += 1
         trades += 1
-    return pnl, trades
+        tr = float(out.get("trade_ret", 0.0))
+        pnl += (tr * fr) - (cost * fr)
+        slippage_sum += float(out.get("slippage_bps", 0.0))
+        slippage_n += 1
+    exec_stats = {
+        "attempted_trades": float(attempted),
+        "filled_trades": float(filled),
+        "partial_fills": float(partial),
+        "canceled_trades": float(canceled),
+        "fill_rate": float(filled / attempted) if attempted else 0.0,
+        "cancel_rate": float(canceled / attempted) if attempted else 0.0,
+        "avg_slippage_bps": float(slippage_sum / slippage_n) if slippage_n else 0.0,
+    }
+    return pnl, trades, exec_stats
 
 
 def _pnl_net_brl(
@@ -469,9 +585,12 @@ def _pnl_net_brl(
     trailing_distance_rr: float,
     trailing_lock_breakeven: bool,
     disable_take_profit_when_trailing: bool,
-) -> tuple[float, int, float, float]:
+    entry_latency_steps: int,
+    allow_partial_fill: bool,
+    min_fill_ratio: float,
+) -> tuple[float, int, float, float, dict[str, float]]:
     if bankroll_brl <= 0 or risk_pct <= 0 or stop_loss_pct <= 0:
-        return 0.0, 0, 0.0, 0.0
+        return 0.0, 0, 0.0, 0.0, {"attempted_trades": 0.0, "filled_trades": 0.0}
     risk_amount = bankroll_brl * risk_pct
     position_notional = risk_amount / stop_loss_pct
     cost = 2.0 * (cost_bps_side / 10000.0)
@@ -485,7 +604,7 @@ def _pnl_net_brl(
         row_idx = int(row.get("row_idx", -1))
         if row_idx < 0:
             continue
-        trade_ret = _simulate_trade_ret(
+        out = _simulate_trade_outcome(
             all_rows=all_rows,
             row_idx=row_idx,
             side=p,
@@ -497,8 +616,16 @@ def _pnl_net_brl(
             trailing_distance_rr=trailing_distance_rr,
             trailing_lock_breakeven=trailing_lock_breakeven,
             disable_take_profit_when_trailing=disable_take_profit_when_trailing,
+            requested_qty=position_notional / max(float(row.get("mid_price", 1.0)), 1.0e-12),
+            latency_steps=entry_latency_steps,
+            allow_partial_fill=allow_partial_fill,
+            min_fill_ratio=min_fill_ratio,
         )
-        trade_pnl = (trade_ret - cost) * position_notional
+        if float(out.get("filled", 0.0)) <= 0:
+            continue
+        fr = float(out.get("fill_ratio", 0.0))
+        trade_ret = float(out.get("trade_ret", 0.0))
+        trade_pnl = ((trade_ret * fr) - (cost * fr)) * position_notional
         pnl += trade_pnl
         trades += 1
         if pnl > peak:
@@ -507,7 +634,8 @@ def _pnl_net_brl(
         if dd > max_dd:
             max_dd = dd
     expectancy = (pnl / trades) if trades else 0.0
-    return pnl, trades, max_dd, expectancy
+    exec_stats = {"attempted_trades": float(sum(1 for p in preds if p != 0)), "filled_trades": float(trades)}
+    return pnl, trades, max_dd, expectancy, exec_stats
 
 
 def _build_trade_plans_and_equity(
@@ -526,6 +654,9 @@ def _build_trade_plans_and_equity(
     trailing_distance_rr: float,
     trailing_lock_breakeven: bool,
     disable_take_profit_when_trailing: bool,
+    entry_latency_steps: int,
+    allow_partial_fill: bool,
+    min_fill_ratio: float,
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
     if bankroll_brl <= 0 or risk_pct <= 0 or stop_loss_pct <= 0:
         return [], {
@@ -567,7 +698,7 @@ def _build_trade_plans_and_equity(
             if is_long
             else entry * (1.0 - (stop_loss_pct * risk_reward_ratio))
         )
-        trade_ret = _simulate_trade_ret(
+        out = _simulate_trade_outcome(
             all_rows=all_rows,
             row_idx=row_idx,
             side=p,
@@ -579,8 +710,16 @@ def _build_trade_plans_and_equity(
             trailing_distance_rr=trailing_distance_rr,
             trailing_lock_breakeven=trailing_lock_breakeven,
             disable_take_profit_when_trailing=disable_take_profit_when_trailing,
+            requested_qty=qty,
+            latency_steps=entry_latency_steps,
+            allow_partial_fill=allow_partial_fill,
+            min_fill_ratio=min_fill_ratio,
         )
-        trade_pnl_brl = (trade_ret - cost) * position_notional
+        if float(out.get("filled", 0.0)) <= 0:
+            continue
+        fr = float(out.get("fill_ratio", 0.0))
+        trade_ret = float(out.get("trade_ret", 0.0))
+        trade_pnl_brl = ((trade_ret * fr) - (cost * fr)) * position_notional
         bankroll += trade_pnl_brl
         if trade_pnl_brl >= 0:
             wins += 1
@@ -601,6 +740,8 @@ def _build_trade_plans_and_equity(
                 "risk_brl": risk_amount,
                 "position_notional_brl": position_notional,
                 "qty": qty,
+                "fill_ratio": fr,
+                "regime_label": str(row.get("regime_label", "unknown")),
                 "pnl_brl": trade_pnl_brl,
                 "bankroll_after_brl": bankroll,
             }
@@ -637,17 +778,31 @@ def _evaluate_paper_aligned_rows(
     max_spread_brl: float,
     regime_gate_enabled: bool = False,
     regime_chop_min_confidence: float = 0.78,
-) -> tuple[list[FoldResult], list[dict[str, float]], list[dict[str, Any]], list[dict[str, Any]]]:
+    embargo_gap_steps: int = 0,
+    entry_latency_steps: int = 0,
+    allow_partial_fill: bool = True,
+    min_fill_ratio: float = 0.1,
+) -> tuple[
+    list[FoldResult],
+    list[dict[str, float]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+]:
     trading_params = load_trading_params()
     paper_cfg = load_paper_mode_config()
-    splits = _walk_forward_splits(len(labeled_rows), n_folds)
+    splits = _walk_forward_splits(len(labeled_rows), n_folds, embargo_gap_steps)
     folds: list[FoldResult] = []
     folds_brl: list[dict[str, float]] = []
     fold_equity: list[dict[str, Any]] = []
     fold_trade_samples: list[dict[str, Any]] = []
-    for i, (train_start, train_end, test_end) in enumerate(splits, start=1):
+    fold_exec_stats: list[dict[str, Any]] = []
+    regime_metrics: dict[str, dict[str, float]] = {}
+    epoch_metrics: dict[str, dict[str, float]] = {"early": {"trades": 0.0, "pnl_brl": 0.0}, "mid": {"trades": 0.0, "pnl_brl": 0.0}, "late": {"trades": 0.0, "pnl_brl": 0.0}}
+    for i, (train_start, train_end, test_start, test_end) in enumerate(splits, start=1):
         train_rows = labeled_rows[train_start:train_end]
-        test_rows = labeled_rows[train_end:test_end]
+        test_rows = labeled_rows[test_start:test_end]
         if not train_rows or not test_rows:
             continue
         strategy = create_strategy(strategy_name, **(strategy_kwargs or {}))
@@ -672,7 +827,7 @@ def _evaluate_paper_aligned_rows(
                 intent = sig.action_intent
             y_pred.append(1 if intent == "long" else -1 if intent == "short" else 0)
         acc = _accuracy(y_true, y_pred)
-        pnl, trades = _pnl_net(
+        pnl, trades, exec_stats = _pnl_net(
             test_rows,
             y_pred,
             all_rows=feature_rows,
@@ -685,8 +840,11 @@ def _evaluate_paper_aligned_rows(
             trailing_distance_rr=paper_cfg.position_rules.trailing_distance_rr,
             trailing_lock_breakeven=paper_cfg.position_rules.trailing_lock_breakeven,
             disable_take_profit_when_trailing=paper_cfg.position_rules.disable_take_profit_when_trailing,
+            entry_latency_steps=entry_latency_steps,
+            allow_partial_fill=allow_partial_fill,
+            min_fill_ratio=min_fill_ratio,
         )
-        pnl_brl, trades_brl, max_dd_brl, expectancy_brl = _pnl_net_brl(
+        pnl_brl, trades_brl, max_dd_brl, expectancy_brl, exec_stats_brl = _pnl_net_brl(
             test_rows,
             y_pred,
             all_rows=feature_rows,
@@ -701,8 +859,12 @@ def _evaluate_paper_aligned_rows(
             trailing_distance_rr=paper_cfg.position_rules.trailing_distance_rr,
             trailing_lock_breakeven=paper_cfg.position_rules.trailing_lock_breakeven,
             disable_take_profit_when_trailing=paper_cfg.position_rules.disable_take_profit_when_trailing,
+            entry_latency_steps=entry_latency_steps,
+            allow_partial_fill=allow_partial_fill,
+            min_fill_ratio=min_fill_ratio,
         )
-        folds.append(FoldResult(i, len(train_rows), len(test_rows), acc, pnl, trades))
+        # Single trade definition across reports: use BRL/risk-based executed trades.
+        folds.append(FoldResult(i, len(train_rows), len(test_rows), acc, pnl, trades_brl))
         trade_plans, equity = _build_trade_plans_and_equity(
             test_rows,
             y_pred,
@@ -718,6 +880,9 @@ def _evaluate_paper_aligned_rows(
             trailing_distance_rr=paper_cfg.position_rules.trailing_distance_rr,
             trailing_lock_breakeven=paper_cfg.position_rules.trailing_lock_breakeven,
             disable_take_profit_when_trailing=paper_cfg.position_rules.disable_take_profit_when_trailing,
+            entry_latency_steps=entry_latency_steps,
+            allow_partial_fill=allow_partial_fill,
+            min_fill_ratio=min_fill_ratio,
         )
         fold_equity.append({"fold_id": i, **equity})
         fold_trade_samples.append(
@@ -736,7 +901,22 @@ def _evaluate_paper_aligned_rows(
                 "expectancy_brl_per_trade": expectancy_brl,
             }
         )
-    return folds, folds_brl, fold_equity, fold_trade_samples
+        fold_exec_stats.append({"fold_id": i, **exec_stats, **exec_stats_brl})
+        for tp in trade_plans:
+            rg = str(tp.get("regime_label", "unknown"))
+            bucket = regime_metrics.setdefault(rg, {"trades": 0.0, "pnl_brl": 0.0})
+            bucket["trades"] += 1.0
+            bucket["pnl_brl"] += float(tp.get("pnl_brl", 0.0))
+        n_tp = len(trade_plans)
+        if n_tp:
+            a = n_tp // 3
+            b = (2 * n_tp) // 3
+            for idx_tp, tp in enumerate(trade_plans):
+                ep = "early" if idx_tp < a else "mid" if idx_tp < b else "late"
+                epoch_metrics[ep]["trades"] += 1.0
+                epoch_metrics[ep]["pnl_brl"] += float(tp.get("pnl_brl", 0.0))
+    stability_segments = {"regime_metrics": regime_metrics, "epoch_metrics": epoch_metrics}
+    return folds, folds_brl, fold_equity, fold_trade_samples, fold_exec_stats, stability_segments
 
 
 def build_paper_aligned_dataset(
@@ -796,10 +976,21 @@ def run_paper_aligned_training_from_dataset(
     max_spread_brl: float = 1.0e12,
     regime_gate_enabled: bool = False,
     regime_chop_min_confidence: float = 0.78,
+    embargo_gap_steps: int = 0,
+    entry_latency_steps: int = 0,
+    allow_partial_fill: bool = True,
+    min_fill_ratio: float = 0.1,
 ) -> dict[str, Any]:
     feature_rows = dataset["feature_rows"]
     labeled_rows = dataset["labeled_rows"]
-    folds, folds_brl, fold_equity, fold_trade_samples = _evaluate_paper_aligned_rows(
+    (
+        folds,
+        folds_brl,
+        fold_equity,
+        fold_trade_samples,
+        fold_exec_stats,
+        stability_segments,
+    ) = _evaluate_paper_aligned_rows(
         feature_rows=feature_rows,
         labeled_rows=labeled_rows,
         strategy_name=strategy_name,
@@ -811,6 +1002,10 @@ def run_paper_aligned_training_from_dataset(
         max_spread_brl=max_spread_brl,
         regime_gate_enabled=regime_gate_enabled,
         regime_chop_min_confidence=regime_chop_min_confidence,
+        embargo_gap_steps=embargo_gap_steps,
+        entry_latency_steps=entry_latency_steps,
+        allow_partial_fill=allow_partial_fill,
+        min_fill_ratio=min_fill_ratio,
     )
 
     trading_params = load_trading_params()
@@ -828,6 +1023,10 @@ def run_paper_aligned_training_from_dataset(
         "max_spread_brl": max_spread_brl,
         "regime_gate_enabled": regime_gate_enabled,
         "regime_chop_min_confidence": regime_chop_min_confidence,
+        "embargo_gap_steps": embargo_gap_steps,
+        "entry_latency_steps": entry_latency_steps,
+        "allow_partial_fill": allow_partial_fill,
+        "min_fill_ratio": min_fill_ratio,
         "execution_backtest": {
             "stop_loss_pct": trading_params.risk.default_stop_loss_pct,
             "risk_reward_ratio": trading_params.risk.risk_reward_ratio,
@@ -841,6 +1040,8 @@ def run_paper_aligned_training_from_dataset(
         "folds_brl": folds_brl,
         "fold_equity": fold_equity,
         "fold_trade_samples": fold_trade_samples,
+        "fold_execution_quality": fold_exec_stats,
+        "stability_segments": stability_segments,
         "summary": {
             "mean_accuracy": (sum(f.accuracy for f in folds) / len(folds)) if folds else 0.0,
             "mean_pnl_net": (sum(f.pnl_net for f in folds) / len(folds)) if folds else 0.0,
@@ -869,6 +1070,21 @@ def run_paper_aligned_training_from_dataset(
             "mean_win_rate": (
                 sum(f["win_rate"] for f in fold_equity) / len(fold_equity) if fold_equity else 0.0
             ),
+            "mean_fill_rate": (
+                sum(f.get("fill_rate", 0.0) for f in fold_exec_stats) / len(fold_exec_stats)
+                if fold_exec_stats
+                else 0.0
+            ),
+            "mean_cancel_rate": (
+                sum(f.get("cancel_rate", 0.0) for f in fold_exec_stats) / len(fold_exec_stats)
+                if fold_exec_stats
+                else 0.0
+            ),
+            "mean_slippage_bps": (
+                sum(f.get("avg_slippage_bps", 0.0) for f in fold_exec_stats) / len(fold_exec_stats)
+                if fold_exec_stats
+                else 0.0
+            ),
         },
     }
     report_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -891,6 +1107,10 @@ def run_paper_aligned_training(
     max_spread_brl: float = 1.0e12,
     regime_gate_enabled: bool = False,
     regime_chop_min_confidence: float = 0.78,
+    embargo_gap_steps: int = 0,
+    entry_latency_steps: int = 0,
+    allow_partial_fill: bool = True,
+    min_fill_ratio: float = 0.1,
 ) -> dict[str, Any]:
     dataset = build_paper_aligned_dataset(
         raw_root=raw_root,
@@ -912,4 +1132,8 @@ def run_paper_aligned_training(
         max_spread_brl=max_spread_brl,
         regime_gate_enabled=regime_gate_enabled,
         regime_chop_min_confidence=regime_chop_min_confidence,
+        embargo_gap_steps=embargo_gap_steps,
+        entry_latency_steps=entry_latency_steps,
+        allow_partial_fill=allow_partial_fill,
+        min_fill_ratio=min_fill_ratio,
     )

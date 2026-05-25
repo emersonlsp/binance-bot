@@ -45,6 +45,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.78,
         help="Regime chop confidence floor when regime gate is on.",
     )
+    p.add_argument("--embargo-gap-steps", type=int, default=0, help="Purge/embargo gap between train and test windows.")
+    p.add_argument("--entry-latency-steps", type=int, default=0, help="Execution latency in event steps.")
+    p.add_argument(
+        "--allow-partial-fill",
+        choices=["on", "off"],
+        default="on",
+        help="Allow partial fills in execution simulation.",
+    )
+    p.add_argument("--min-fill-ratio", type=float, default=0.1, help="Minimum fill ratio required to execute.")
     p.add_argument(
         "--raw-root",
         type=Path,
@@ -81,6 +90,10 @@ def main() -> None:
             xgb_device=args.xgb_device,
             regime_gate=(args.regime_gate == "on"),
             regime_chop_min_confidence=args.regime_chop_min_confidence,
+            embargo_gap_steps=max(0, args.embargo_gap_steps),
+            entry_latency_steps=max(0, args.entry_latency_steps),
+            allow_partial_fill=(args.allow_partial_fill == "on"),
+            min_fill_ratio=float(args.min_fill_ratio),
         )
         result = run_xgb_clean_search(raw_root=args.raw_root, output_dir=out_dir, cfg=cfg)
         promoted = result.get("promoted_champion")

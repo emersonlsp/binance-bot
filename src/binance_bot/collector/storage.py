@@ -38,20 +38,28 @@ class ParquetBufferWriter:
         if not rows:
             return
         now = datetime.now(UTC)
-        path = (
-            self.base_dir
-            / self.exchange
-            / self.symbol
-            / stream
-            / f"{now:%Y}"
-            / f"{now:%m}"
-            / f"{now:%d}"
-        )
-        path.mkdir(parents=True, exist_ok=True)
-        table = pa.Table.from_pylist(rows)
-        self._flush_counter[stream] += 1
-        file_path = path / (
-            f"{self.symbol}_{stream}_{now:%Y%m%d_%H%M%S}_{self._flush_counter[stream]:06d}.parquet"
-        )
-        pq.write_table(table, file_path)
+        buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            ts = row.get("ts_receive")
+            day_key = ""
+            if isinstance(ts, str) and ts:
+                try:
+                    day_dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(UTC)
+                    day_key = day_dt.strftime("%Y/%m/%d")
+                except ValueError:
+                    day_key = ""
+            if not day_key:
+                day_key = now.strftime("%Y/%m/%d")
+            buckets[day_key].append(row)
+
+        for day_key, day_rows in buckets.items():
+            yyyy, mm, dd = day_key.split("/")
+            path = self.base_dir / self.exchange / self.symbol / stream / yyyy / mm / dd
+            path.mkdir(parents=True, exist_ok=True)
+            table = pa.Table.from_pylist(day_rows)
+            self._flush_counter[stream] += 1
+            file_path = path / (
+                f"{self.symbol}_{stream}_{now:%Y%m%d_%H%M%S}_{self._flush_counter[stream]:06d}.parquet"
+            )
+            pq.write_table(table, file_path)
         self._buffers[stream].clear()
