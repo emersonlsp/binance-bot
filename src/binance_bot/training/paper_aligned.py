@@ -593,10 +593,12 @@ def _pnl_net(
     for row, p in zip(rows, preds):
         if p == 0:
             continue
-        attempted += 1
         row_idx = int(row.get("row_idx", -1))
         if row_idx < 0:
+            attempted += 1
+            canceled += 1
             continue
+        attempted += 1
         out = _simulate_trade_outcome(
             all_rows=all_rows,
             row_idx=row_idx,
@@ -698,10 +700,12 @@ def _pnl_net_brl(
     for row, p in zip(rows, preds):
         if p == 0:
             continue
-        attempted += 1
         row_idx = int(row.get("row_idx", -1))
         if row_idx < 0:
+            attempted += 1
+            canceled += 1
             continue
+        attempted += 1
         eff_stop_loss_pct, _ = _resolve_stop_tp_pcts(
             all_rows=all_rows,
             row_idx=row_idx,
