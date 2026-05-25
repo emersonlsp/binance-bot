@@ -7,6 +7,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from ..runtime.params import load_trading_params
 from .paper_aligned import build_paper_aligned_dataset, run_paper_aligned_training_from_dataset
 
 
@@ -110,7 +111,8 @@ def main() -> None:
     move_bps = float(params.get("move_threshold_bps", 0.8))
     sample_every = int(params.get("sample_every_updates", 40))
     folds = int(params.get("n_folds", 4))
-    cost_bps = float(params.get("cost_bps_per_side", 1.5))
+    default_fee_bps = float(load_trading_params().risk.taker_fee_bps_per_side)
+    cost_bps = float(params.get("cost_bps_per_side", default_fee_bps))
     min_conf = float(params.get("min_signal_confidence", 0.75))
     max_spread = float(params.get("max_spread_brl", 3.0))
     inherited_regime_gate = bool(search_cfg.get("regime_gate", False))

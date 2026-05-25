@@ -237,7 +237,7 @@ def _try_close_position(state: dict[str, Any], feature: dict[str, Any]) -> dict[
     if not should_close:
         return None
     trading = load_trading_params()
-    cost = 2.0 * (1.5 / 10000.0)
+    cost = 2.0 * (float(trading.risk.taker_fee_bps_per_side) / 10000.0)
     trade_ret = ((exit_price - entry) / entry) if side == "long" else ((entry - exit_price) / entry)
     pnl_brl = (trade_ret - cost) * float(pos["position_notional_brl"])
     state["bankroll_brl"] += pnl_brl

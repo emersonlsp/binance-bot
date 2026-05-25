@@ -963,6 +963,7 @@ def _evaluate_paper_aligned_rows(
     entry_latency_steps: int = 0,
     allow_partial_fill: bool = True,
     min_fill_ratio: float = 0.1,
+    include_trade_samples: bool = True,
 ) -> tuple[
     list[FoldResult],
     list[dict[str, float]],
@@ -989,24 +990,32 @@ def _evaluate_paper_aligned_rows(
         strategy = create_strategy(strategy_name, **(strategy_kwargs or {}))
         strategy.fit(train_rows)
         y_true = [int(r["target_direction"]) for r in test_rows]
-        y_pred = []
-        for r in test_rows:
-            sig = strategy.predict(r)
+        y_pred = [0] * len(test_rows)
+        predict_rows: list[dict[str, Any]] = []
+        predict_idx: list[int] = []
+        for idx, r in enumerate(test_rows):
             spread = float(r.get("spread", 0.0))
             regime_label = str(r.get("regime_label", ""))
             if regime_gate_enabled and regime_label == "high_vol_shock":
-                intent = "none"
-            elif (
-                regime_gate_enabled
-                and regime_label == "chop"
-                and sig.confidence < regime_chop_min_confidence
-            ):
-                intent = "none"
-            elif sig.confidence < min_signal_confidence or spread > max_spread_brl:
-                intent = "none"
-            else:
-                intent = sig.action_intent
-            y_pred.append(1 if intent == "long" else -1 if intent == "short" else 0)
+                continue
+            if spread > max_spread_brl:
+                continue
+            predict_rows.append(r)
+            predict_idx.append(idx)
+        if predict_rows:
+            sigs = strategy.predict_many(predict_rows)
+            for idx, sig in zip(predict_idx, sigs):
+                r = test_rows[idx]
+                regime_label = str(r.get("regime_label", ""))
+                if (
+                    regime_gate_enabled
+                    and regime_label == "chop"
+                    and sig.confidence < regime_chop_min_confidence
+                ):
+                    continue
+                if sig.confidence < min_signal_confidence:
+                    continue
+                y_pred[idx] = 1 if sig.action_intent == "long" else -1 if sig.action_intent == "short" else 0
         acc = _accuracy(y_true, y_pred)
         pnl_brl, trades_brl, max_dd_brl, expectancy_brl, exec_stats_brl = _pnl_net_brl(
             test_rows,
@@ -1067,13 +1076,14 @@ def _evaluate_paper_aligned_rows(
             margin_borrow_interest_hourly=paper_cfg.margin_sim.borrow_interest_hourly,
         )
         fold_equity.append({"fold_id": i, **equity})
-        fold_trade_samples.append(
-            {
-                "fold_id": i,
-                "trade_count": len(trade_plans),
-                "trades_sample": trade_plans[:10],
-            }
-        )
+        if include_trade_samples:
+            fold_trade_samples.append(
+                {
+                    "fold_id": i,
+                    "trade_count": len(trade_plans),
+                    "trades_sample": trade_plans[:10],
+                }
+            )
         folds_brl.append(
             {
                 "fold_id": i,
@@ -1162,6 +1172,7 @@ def run_paper_aligned_training_from_dataset(
     entry_latency_steps: int = 0,
     allow_partial_fill: bool = True,
     min_fill_ratio: float = 0.1,
+    include_trade_samples: bool = True,
 ) -> dict[str, Any]:
     feature_rows = dataset["feature_rows"]
     labeled_rows = dataset["labeled_rows"]
@@ -1188,6 +1199,7 @@ def run_paper_aligned_training_from_dataset(
         entry_latency_steps=entry_latency_steps,
         allow_partial_fill=allow_partial_fill,
         min_fill_ratio=min_fill_ratio,
+        include_trade_samples=include_trade_samples,
     )
 
     trading_params = load_trading_params()
@@ -1230,7 +1242,7 @@ def run_paper_aligned_training_from_dataset(
         "folds": [asdict(f) for f in folds],
         "folds_brl": folds_brl,
         "fold_equity": fold_equity,
-        "fold_trade_samples": fold_trade_samples,
+        "fold_trade_samples": fold_trade_samples if include_trade_samples else [],
         "fold_execution_quality": fold_exec_stats,
         "stability_segments": stability_segments,
         "summary": {

@@ -26,7 +26,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=3,
         help="Min positive folds threshold.",
     )
-    p.add_argument("--workers", type=int, default=6, help="Parallel workers.")
+    p.add_argument("--workers", type=int, default=4, help="Parallel workers.")
     p.add_argument(
         "--xgb-device",
         choices=["cpu", "cuda"],

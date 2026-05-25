@@ -21,7 +21,9 @@ class Strategy(ABC):
     @abstractmethod
     def predict(self, row: dict[str, Any]) -> Signal: ...
 
+    def predict_many(self, rows: list[dict[str, Any]]) -> list[Signal]:
+        return [self.predict(r) for r in rows]
+
     @property
     @abstractmethod
     def name(self) -> str: ...
-

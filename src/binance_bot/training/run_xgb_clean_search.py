@@ -26,7 +26,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--workers",
         type=int,
-        default=1,
+        default=4,
         help="Parallel worker processes (use 2-6 depending on CPU/RAM).",
     )
     p.add_argument(

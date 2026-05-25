@@ -7,10 +7,10 @@ REM
 REM Edite os parametros abaixo como quiser.
 REM ============================================================
 
-set "SEEDS=0"
+set "SEEDS=2,3"
 set "CANDIDATES=100"
 set "FOLDS=4"
-set "WORKERS=6"
+set "WORKERS=4"
 set "XGB_DEVICE=cpu"
 set "REGIME_GATE=on"
 set "OUTPUT_ROOT=artifacts\reports\xgb_clean_search_batch"
@@ -40,9 +40,10 @@ if not exist "%PYTHON_EXE%" (
 
 pushd "%ROOT%"
 set "PYTHONPATH=src"
+set "SEEDS_ARG=%SEEDS:,= %"
 
 "%PYTHON_EXE%" -m binance_bot.training.run_xgb_seed_batch ^
-  --seeds %SEEDS% ^
+  --seeds %SEEDS_ARG% ^
   --candidates %CANDIDATES% ^
   --folds %FOLDS% ^
   --workers %WORKERS% ^
@@ -64,4 +65,3 @@ popd
 echo.
 pause
 endlocal
-

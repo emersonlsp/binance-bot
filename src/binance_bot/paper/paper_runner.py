@@ -346,7 +346,7 @@ def _try_close_position(
         return None
 
     trading = load_trading_params()
-    cost = 2.0 * (1.5 / 10000.0)
+    cost = 2.0 * (float(trading.risk.taker_fee_bps_per_side) / 10000.0)
     if side == "long":
         trade_ret = (exit_price - entry) / entry
     else:

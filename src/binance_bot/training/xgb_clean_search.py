@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -13,6 +14,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from ..runtime.params import load_trading_params
 from .paper_aligned import build_paper_aligned_dataset, run_paper_aligned_training_from_dataset
 
 
@@ -23,7 +25,7 @@ class SearchConfig:
     min_trades: int = 40
     min_positive_folds: int = 3
     seed: int = 42
-    workers: int = 1
+    workers: int = 4
     regime_gate: bool = False
     regime_chop_min_confidence: float = 0.78
     xgb_device: str = "cpu"
@@ -31,6 +33,7 @@ class SearchConfig:
     entry_latency_steps: int = 0
     allow_partial_fill: bool = True
     min_fill_ratio: float = 0.1
+    detailed_report_top_n: int = 1
 
 
 def _dir_fingerprint(root: Path) -> dict[str, int]:
@@ -115,7 +118,7 @@ def _evaluate_existing_champion_on_current_data(
         n_folds = int(params.get("n_folds", cfg.n_folds))
         min_sig = float(params["min_signal_confidence"])
         max_spread = float(params["max_spread_brl"])
-        cost = float(params.get("cost_bps_per_side", 1.5))
+        cost = float(params.get("cost_bps_per_side", load_trading_params().risk.taker_fee_bps_per_side))
         strategy_kwargs = dict(params.get("strategy_kwargs", {}))
     except Exception:
         return None
@@ -214,7 +217,7 @@ def _sample_candidate(
         "horizon_steps": horizon_steps,
         "move_threshold_bps": move_threshold_bps,
         "sample_every_updates": sample_every_updates,
-        "cost_bps_per_side": 1.5,
+        "cost_bps_per_side": 0.0,
         "min_signal_confidence": min_signal_confidence,
         "max_spread_brl": max_spread_brl,
     }
@@ -264,6 +267,7 @@ def _evaluate_baselines(
     entry_latency_steps: int,
     allow_partial_fill: bool,
     min_fill_ratio: float,
+    cost_bps_per_side: float,
 ) -> list[dict[str, Any]]:
     specs = [
         ("baseline_no_trade_v1", {}, 0.0, 1.0e12),
@@ -278,7 +282,7 @@ def _evaluate_baselines(
             strategy_kwargs=kwargs,
             horizon_steps=horizon_steps,
             n_folds=n_folds,
-            cost_bps_per_side=1.5,
+            cost_bps_per_side=cost_bps_per_side,
             sample_every_updates=sample_every_updates,
             min_signal_confidence=min_conf,
             max_spread_brl=max_spread,
@@ -288,6 +292,7 @@ def _evaluate_baselines(
             entry_latency_steps=entry_latency_steps,
             allow_partial_fill=allow_partial_fill,
             min_fill_ratio=min_fill_ratio,
+            include_trade_samples=False,
         )
         stability = _fold_stability(report.get("folds_brl", []))
         out.append(
@@ -336,6 +341,7 @@ def _evaluate_candidate(
     entry_latency_steps: int,
     allow_partial_fill: bool,
     min_fill_ratio: float,
+    include_trade_samples: bool = True,
 ) -> dict[str, Any]:
     report = run_paper_aligned_training_from_dataset(
         dataset=dataset,
@@ -354,6 +360,7 @@ def _evaluate_candidate(
         entry_latency_steps=entry_latency_steps,
         allow_partial_fill=allow_partial_fill,
         min_fill_ratio=min_fill_ratio,
+        include_trade_samples=include_trade_samples,
     )
     entry = {
         "name": candidate["name"],
@@ -414,6 +421,7 @@ def _evaluate_group(
     entry_latency_steps: int,
     allow_partial_fill: bool,
     min_fill_ratio: float,
+    include_trade_samples: bool = True,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for candidate in candidates:
@@ -435,9 +443,23 @@ def _evaluate_group(
                 entry_latency_steps=entry_latency_steps,
                 allow_partial_fill=allow_partial_fill,
                 min_fill_ratio=min_fill_ratio,
+                include_trade_samples=include_trade_samples,
             )
         )
     return out
+
+
+def _chunked(items: list[dict[str, Any]], chunk_size: int) -> list[list[dict[str, Any]]]:
+    if chunk_size <= 0:
+        return [items]
+    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+def _fmt_eta(seconds: float) -> str:
+    secs = max(0.0, float(seconds))
+    if secs >= 3600.0:
+        return f"{(secs / 3600.0):.2f}h"
+    return f"{(secs / 60.0):.1f}m"
 
 
 def _parse_iso_utc(ts: str) -> datetime:
@@ -498,17 +520,23 @@ def run_xgb_clean_search(
     output_dir: Path,
     cfg: SearchConfig,
 ) -> dict[str, Any]:
+    os.environ.setdefault("PYTHONOPTIMIZE", "1")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
     t0 = time.perf_counter()
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = Path("data/features/binance/BTCBRL/xgb_clean_cache")
     cache_dir.mkdir(parents=True, exist_ok=True)
     raw_fp = _raw_data_fingerprint(raw_root)
+    trading_params = load_trading_params()
+    fee_bps_per_side = float(trading_params.risk.taker_fee_bps_per_side)
     rng = Random(cfg.seed)
     regime_times, regime_labels = _load_regime_series() if cfg.regime_gate else ([], [])
     if cfg.regime_gate:
         print(f"[xgb_clean] regime gate enabled. regime_points={len(regime_times)}")
 
-    xgb_n_jobs = 1 if cfg.workers > 1 else 4
+    cpu_total = max(1, (os.cpu_count() or 4))
+    xgb_n_jobs = 1 if cfg.workers > 1 else min(4, cpu_total)
     # Keep dataset regimes limited to maximize cache reuse and reduce expensive feature rebuilding.
     data_profiles = [
         (50, 0.5, 20),
@@ -528,9 +556,14 @@ def run_xgb_clean_search(
         )
         for i in range(1, cfg.candidates + 1)
     ]
+    for c in candidates:
+        c["cost_bps_per_side"] = fee_bps_per_side
     entries: list[dict[str, Any]] = []
     total_candidates = len(candidates)
     completed_candidates = 0
+    t_candidates_started = time.perf_counter()
+    benchmark_chunks_done = 0
+    t_last_checkpoint = t_candidates_started
     groups: dict[tuple[int, float, int], list[dict[str, Any]]] = {}
     for c in candidates:
         key = (
@@ -613,6 +646,7 @@ def run_xgb_clean_search(
             entry_latency_steps=cfg.entry_latency_steps,
             allow_partial_fill=cfg.allow_partial_fill,
             min_fill_ratio=cfg.min_fill_ratio,
+            cost_bps_per_side=fee_bps_per_side,
         )
         baseline_by_key[key] = baselines
         baseline_ref_by_key[key] = _best_baseline(baselines)
@@ -642,6 +676,7 @@ def run_xgb_clean_search(
             entry_latency_steps=cfg.entry_latency_steps,
             allow_partial_fill=cfg.allow_partial_fill,
             min_fill_ratio=cfg.min_fill_ratio,
+            cost_bps_per_side=fee_bps_per_side,
         )
         baseline_by_key[key] = baselines
         baseline_ref_by_key[key] = _best_baseline(baselines)
@@ -676,6 +711,7 @@ def run_xgb_clean_search(
                     entry_latency_steps=cfg.entry_latency_steps,
                     allow_partial_fill=cfg.allow_partial_fill,
                     min_fill_ratio=cfg.min_fill_ratio,
+                    include_trade_samples=False,
                 )
                 entries.append(entry)
                 s = entry["summary"]
@@ -686,6 +722,19 @@ def run_xgb_clean_search(
                 )
                 completed_candidates += 1
                 print(f"[xgb_clean] progress {completed_candidates}/{total_candidates}", flush=True)
+                if completed_candidates % 6 == 0:
+                    now = time.perf_counter()
+                    chunk_secs = now - t_last_checkpoint
+                    remaining = max(0, total_candidates - completed_candidates)
+                    benchmark_chunks_done += 1
+                    if benchmark_chunks_done >= 2:
+                        eta_secs = chunk_secs * (remaining / 6.0)
+                        print(
+                            f"[xgb_clean] benchmark chunk=6 done={completed_candidates}/{total_candidates} "
+                            f"last6={chunk_secs / 60.0:.1f}m eta={_fmt_eta(eta_secs)}",
+                            flush=True,
+                        )
+                    t_last_checkpoint = now
     else:
         with ProcessPoolExecutor(max_workers=cfg.workers) as ex:
             futures = {}
@@ -694,10 +743,11 @@ def run_xgb_clean_search(
                 key_name = f"h{h}_m{str(m).replace('.', '_')}_s{s_upd}"
                 ds = dataset_by_key[key]
                 baseline_ref = baseline_ref_by_key[key]
-                for candidate in group:
+                chunk_size = max(1, min(4, len(group) // max(1, cfg.workers)))
+                for candidate_chunk in _chunked(group, chunk_size):
                     fut = ex.submit(
-                        _evaluate_candidate,
-                        candidate,
+                        _evaluate_group,
+                        candidates=candidate_chunk,
                         search_seed=cfg.seed,
                         output_dir=output_dir,
                         dataset=ds,
@@ -713,19 +763,34 @@ def run_xgb_clean_search(
                         entry_latency_steps=cfg.entry_latency_steps,
                         allow_partial_fill=cfg.allow_partial_fill,
                         min_fill_ratio=cfg.min_fill_ratio,
+                        include_trade_samples=False,
                     )
-                    futures[fut] = candidate["name"]
+                    futures[fut] = len(candidate_chunk)
             for fut in as_completed(futures):
-                entry = fut.result()
-                entries.append(entry)
-                s = entry["summary"]
-                print(
-                    f"[xgb_clean] {entry['name']} pnl_brl={s['mean_pnl_net_brl']:.2f} "
-                    f"exp={s['mean_expectancy_brl_per_trade']:.2f} trades={s['total_trades']} "
-                    f"score={entry['score']:.2f}"
-                )
-                completed_candidates += 1
-                print(f"[xgb_clean] progress {completed_candidates}/{total_candidates}", flush=True)
+                chunk_entries = fut.result()
+                for entry in chunk_entries:
+                    entries.append(entry)
+                    s = entry["summary"]
+                    print(
+                        f"[xgb_clean] {entry['name']} pnl_brl={s['mean_pnl_net_brl']:.2f} "
+                        f"exp={s['mean_expectancy_brl_per_trade']:.2f} trades={s['total_trades']} "
+                        f"score={entry['score']:.2f}"
+                    )
+                    completed_candidates += 1
+                    print(f"[xgb_clean] progress {completed_candidates}/{total_candidates}", flush=True)
+                    if completed_candidates % 6 == 0:
+                        now = time.perf_counter()
+                        chunk_secs = now - t_last_checkpoint
+                        remaining = max(0, total_candidates - completed_candidates)
+                        benchmark_chunks_done += 1
+                        if benchmark_chunks_done >= 2:
+                            eta_secs = chunk_secs * (remaining / 6.0)
+                            print(
+                                f"[xgb_clean] benchmark chunk=6 done={completed_candidates}/{total_candidates} "
+                                f"last6={chunk_secs / 60.0:.1f}m eta={_fmt_eta(eta_secs)}",
+                                flush=True,
+                            )
+                        t_last_checkpoint = now
 
     entries.sort(key=lambda x: float(x["score"]), reverse=True)
     champion = entries[0] if entries else None
@@ -762,6 +827,8 @@ def run_xgb_clean_search(
             "cache_phase_seconds": round(t_after_cache - t0, 3),
             "candidate_phase_seconds": 0.0,
             "total_seconds": 0.0,
+            "postprocess_seconds": 0.0,
+            "wall_total_seconds": 0.0,
             "cache_hit_count": cache_hit_count,
             "cache_build_count": cache_build_count,
             "dataset_groups_count": len(groups),
@@ -788,14 +855,57 @@ def run_xgb_clean_search(
         "fold_equity": [],
         "fold_trade_samples": [],
     }
+    t_core_end = time.perf_counter()
+    payload["timing"]["candidate_phase_seconds"] = round(t_core_end - t_after_cache, 3)
+    payload["timing"]["total_seconds"] = round(t_core_end - t0, 3)
+
     selected = promoted_champion or champion
-    if selected:
-        candidate_report_path = output_dir / f"{selected['name']}.json"
-        if candidate_report_path.exists():
-            candidate_report = json.loads(candidate_report_path.read_text(encoding="utf-8"))
+    if selected and int(cfg.detailed_report_top_n) > 0:
+        sparams = dict(selected.get("params", {}))
+        selected_key = (
+            int(sparams.get("horizon_steps", 80)),
+            float(sparams.get("move_threshold_bps", 0.8)),
+            int(sparams.get("sample_every_updates", 40)),
+        )
+        ds = dataset_by_key.get(selected_key)
+        baseline_ref = baseline_ref_by_key.get(selected_key)
+        if ds is not None and baseline_ref is not None:
+            selected = _evaluate_candidate(
+                {
+                    "name": selected["name"],
+                    "strategy_name": selected.get("strategy_name", "mlofi_xgb_v1"),
+                    "strategy_kwargs": dict(sparams.get("strategy_kwargs", {})),
+                    "horizon_steps": int(sparams.get("horizon_steps", 80)),
+                    "move_threshold_bps": float(sparams.get("move_threshold_bps", 0.8)),
+                    "sample_every_updates": int(sparams.get("sample_every_updates", 40)),
+                    "cost_bps_per_side": float(sparams.get("cost_bps_per_side", fee_bps_per_side)),
+                    "min_signal_confidence": float(sparams.get("min_signal_confidence", 0.75)),
+                    "max_spread_brl": float(sparams.get("max_spread_brl", 3.0)),
+                },
+                search_seed=cfg.seed,
+                output_dir=output_dir,
+                dataset=ds,
+                dataset_key=str(sparams.get("dataset_key", "selected")),
+                sample_every_updates=int(sparams.get("sample_every_updates", 40)),
+                n_folds=int(sparams.get("n_folds", cfg.n_folds)),
+                min_trades=cfg.min_trades,
+                min_positive_folds=cfg.min_positive_folds,
+                baseline_ref=baseline_ref,
+                regime_gate_enabled=cfg.regime_gate,
+                regime_chop_min_confidence=cfg.regime_chop_min_confidence,
+                embargo_gap_steps=cfg.embargo_gap_steps,
+                entry_latency_steps=cfg.entry_latency_steps,
+                allow_partial_fill=cfg.allow_partial_fill,
+                min_fill_ratio=cfg.min_fill_ratio,
+                include_trade_samples=True,
+            )
+            candidate_report = json.loads((output_dir / f"{selected['name']}.json").read_text(encoding="utf-8"))
             equity_payload["selected"] = {
                 "name": selected["name"],
-                "promoted": bool(selected is promoted_champion),
+                "promoted": bool(
+                    promoted_champion is not None
+                    and str(selected.get("name", "")) == str(promoted_champion.get("name", ""))
+                ),
                 "params": selected.get("params", {}),
             }
             equity_payload["summary"] = candidate_report.get("summary", {})
@@ -841,8 +951,8 @@ def run_xgb_clean_search(
         payload["champion_action"] = "[xgb_clean] champion_action: kept_current_champion (no promoted candidate)"
         print(payload["champion_action"])
     t_end = time.perf_counter()
-    payload["timing"]["candidate_phase_seconds"] = round(t_end - t_after_cache, 3)
-    payload["timing"]["total_seconds"] = round(t_end - t0, 3)
+    payload["timing"]["postprocess_seconds"] = round(t_end - t_core_end, 3)
+    payload["timing"]["wall_total_seconds"] = round(t_end - t0, 3)
     (output_dir / "leaderboard.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(
         f"[xgb_clean] timing cache={payload['timing']['cache_phase_seconds']:.1f}s "

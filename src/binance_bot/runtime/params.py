@@ -16,6 +16,7 @@ class RiskParams:
     order_notional_pct: float = 0.01
     min_position_notional_brl: float = 50.0
     max_position_notional_brl: float = 3000.0
+    taker_fee_bps_per_side: float = 1.5
 
 
 @dataclass(slots=True)
@@ -39,5 +40,6 @@ def load_trading_params(path: Path | None = None) -> TradingParams:
             order_notional_pct=float(risk.get("order_notional_pct", 0.01)),
             min_position_notional_brl=float(risk.get("min_position_notional_brl", 50.0)),
             max_position_notional_brl=float(risk.get("max_position_notional_brl", 3000.0)),
+            taker_fee_bps_per_side=float(risk.get("taker_fee_bps_per_side", 1.5)),
         )
     )
