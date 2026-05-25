@@ -10,6 +10,7 @@ from typing import Any
 from ..collector.binance_spot import BinanceSpotClient
 from ..collector.config import CollectorConfig
 from ..collector.env_loader import load_dotenv
+from ..paper.config import load_paper_mode_config
 from ..runtime.params import load_trading_params
 from ..strategies.registry import create_strategy
 from ..training.paper_aligned import build_paper_aligned_dataset
@@ -163,8 +164,8 @@ def _build_feature_from_book(
 
 def _open_position(state: dict[str, Any], side: str, entry: float, params: dict[str, Any], ts: str) -> dict[str, Any]:
     trading = load_trading_params()
-    stop_loss_pct = trading.risk.default_stop_loss_pct
-    rr = trading.risk.risk_reward_ratio
+    stop_loss_pct = float(params.get("effective_stop_loss_pct", trading.risk.default_stop_loss_pct))
+    tp_pct = float(params.get("effective_take_profit_pct", stop_loss_pct * trading.risk.risk_reward_ratio))
     raw_notional = state["bankroll_brl"] * trading.risk.order_notional_pct
     min_notional = max(0.0, float(getattr(trading.risk, "min_position_notional_brl", 0.0)))
     max_notional = max(0.0, float(getattr(trading.risk, "max_position_notional_brl", 0.0)))
@@ -179,10 +180,10 @@ def _open_position(state: dict[str, Any], side: str, entry: float, params: dict[
     risk_brl = position_notional * stop_loss_pct
     if side == "long":
         sl = entry * (1.0 - stop_loss_pct)
-        tp = entry * (1.0 + (stop_loss_pct * rr))
+        tp = entry * (1.0 + tp_pct)
     else:
         sl = entry * (1.0 + stop_loss_pct)
-        tp = entry * (1.0 - (stop_loss_pct * rr))
+        tp = entry * (1.0 - tp_pct)
     pos = {
         "side": side,
         "entry_price": entry,
@@ -275,6 +276,7 @@ async def run_forever() -> None:
     signals_path = out / "signals.jsonl"
     trades_path = out / "trades.jsonl"
     trading = load_trading_params()
+    paper_cfg = load_paper_mode_config()
     state = _load_state(state_path, trading.risk.paper_bankroll_brl)
     state["open_position"] = None
     _save_state(state_path, _state_summary(state))
@@ -285,6 +287,7 @@ async def run_forever() -> None:
     bid_book: dict[float, float] = {}
     ask_book: dict[float, float] = {}
     updates_seen = 0
+    mid_history: list[float] = []
     last_heartbeat = 0.0
     session_id = f"paper-rt-{datetime.now(UTC):%Y%m%dT%H%M%S}"
 
@@ -326,6 +329,11 @@ async def run_forever() -> None:
                 if not ts or ts == state.get("last_feature_ts", ""):
                     continue
                 state["last_feature_ts"] = ts
+                mid = _safe_float(feature.get("mid_price"), 0.0)
+                if mid > 0:
+                    mid_history.append(mid)
+                    if len(mid_history) > 300:
+                        mid_history = mid_history[-300:]
                 sig = strategy.predict(feature)
                 _append_jsonl(
                     signals_path,
@@ -362,11 +370,35 @@ async def run_forever() -> None:
                         ask = _safe_float(feature.get("ask_price_l1"), 0.0)
                         entry = ask if sig.action_intent == "long" else bid
                         l1_qty = _safe_float(feature.get("ask_size_l1" if sig.action_intent == "long" else "bid_size_l1"), 0.0)
-                        draft = _open_position(state, sig.action_intent, entry, params, ts)
+                        eff_stop = trading.risk.default_stop_loss_pct
+                        eff_tp = eff_stop * trading.risk.risk_reward_ratio
+                        if paper_cfg.position_rules.stop_mode == "volatility" and len(mid_history) >= 20:
+                            lb = max(10, int(paper_cfg.position_rules.vol_lookback_steps))
+                            tail = mid_history[-lb:]
+                            rets: list[float] = []
+                            for i in range(1, len(tail)):
+                                if tail[i - 1] > 0:
+                                    rets.append((tail[i] - tail[i - 1]) / tail[i - 1])
+                            if rets:
+                                mean = sum(rets) / len(rets)
+                                var = sum((r - mean) ** 2 for r in rets) / max(1, len(rets) - 1)
+                                vol = var**0.5
+                                eff_stop = max(
+                                    float(paper_cfg.position_rules.min_stop_loss_pct),
+                                    min(
+                                        float(paper_cfg.position_rules.max_stop_loss_pct),
+                                        float(paper_cfg.position_rules.vol_stop_k) * vol,
+                                    ),
+                                )
+                                eff_tp = max(eff_stop * 0.5, float(paper_cfg.position_rules.vol_tp_k) * vol)
+                        exec_params = dict(params)
+                        exec_params["effective_stop_loss_pct"] = float(eff_stop)
+                        exec_params["effective_take_profit_pct"] = float(eff_tp)
+                        draft = _open_position(state, sig.action_intent, entry, exec_params, ts)
                         state["open_position"] = None
                         req_qty = _safe_float(draft.get("qty"), 0.0)
                         if entry > 0 and l1_qty >= req_qty and req_qty > 0:
-                            pos = _open_position(state, sig.action_intent, entry, params, ts)
+                            pos = _open_position(state, sig.action_intent, entry, exec_params, ts)
                             event_happened = True
                             print(
                                 f"[paper_rt] open {pos['side']} ts={ts} entry={entry:.2f} bid={bid:.2f} ask={ask:.2f} qty={req_qty:.6f}",
@@ -402,4 +434,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -1,33 +1,41 @@
-# Status ML: Collector + XGBoost Clean
+# Status ML: Pipeline Atual (Collector + XGB/Seq + Margin Rules)
 
-## O que já temos
+## O que jÃ¡ temos
 
-- Coletor com snapshots, updates, trades e `collector_logs` com eventos de qualidade.
-- Pipeline com construção de features de book (MLOFI), labels sem vazamento e validação walk-forward.
-- Simulação de PnL líquido com custo e regras de risco.
-- Busca de candidatos XGBoost (`xgb_clean`) com paralelismo e cache.
-- Filtro de vencedores por `mean_pnl_net_brl > 0` em `winners_latest.json`.
+- Coletor Binance com `snapshots`, `updates`, `trades` e `collector_logs`.
+- Sync incremental por bloco com estado (watermark) para acelerar ingestÃ£o.
+- Features de microestrutura (MLOFI), labels sem vazamento e walk-forward com embargo.
+- SimulaÃ§Ã£o de execuÃ§Ã£o realista: latÃªncia, no-fill, partial fill e slippage.
+- Sizing por risco com banca dinÃ¢mica por trade.
+- SL/TP adaptativo por volatilidade com piso de payoff (`tp >= stop * rr`).
+- Busca de candidatos com XGBoost + modelos sequenciais (MLP/GRU).
+- PromoÃ§Ã£o condicionada por baseline e estabilidade por fold.
 
-## Lacunas vs plano
+## Regras de Margin incorporadas na pipeline
 
-- Falta baseline explícito e versionado (ex.: `no-trade`, `imbalance simples`) para comparar ML.
-- Falta separação formal de camadas `processed/training` com versionamento por run.
-- Falta persistência por execução (timestamp) para evitar sobrescrever `leaderboard`.
-- Falta gap temporal explícito entre treino e teste (purge/embargo).
-- Falta avaliação de execução mais realista (fill parcial, no-fill, latência por ordem).
+As regras operacionais/financeiras de margin estÃ£o padronizadas em:
 
-## Próximo passo recomendado (prioridade 1)
+- `docs/binance_margin_rules.md`
 
-Implementar **baseline pack + avaliação comparativa**:
+Pontos obrigatÃ³rios para precificaÃ§Ã£o e operaÃ§Ã£o:
 
-1. Baseline `no-trade` (PnL = 0).
-2. Baseline `imbalance_topN` simples.
-3. Relatório único comparando XGBoost vs baselines após custo.
+1. PnL lÃ­quido deve incluir taxa, slippage e juros de borrow.
+2. Antes de abrir trade em margin: validar `maxBorrowable`.
+3. Tratar erros operacionais (`-3006`, `-3007`, `-3045`, filtros de notional).
+4. Reconciliar liability (principal + juros) apÃ³s fechamento.
+5. Promover estratÃ©gia apenas por mÃ©tricas lÃ­quidas consistentes.
 
-Critério de avanço:
-- XGBoost só promove se superar baselines em PnL líquido e estabilidade por fold.
+## CritÃ©rio de aceitaÃ§Ã£o para candidato "bom"
 
-## Ajuste tático para próxima run
+- `mean_pnl_net_brl > 0`
+- `total_trades` mÃ­nimo aceitÃ¡vel
+- drawdown e expectancy dentro do limite
+- estabilidade por fold e por regime
+- qualidade de execuÃ§Ã£o aceitÃ¡vel (`fill_rate`, `cancel_rate`, slippage)
 
-- Manter filtro primário: `mean_pnl_net_brl > 0`.
-- Aplicar filtro secundário de robustez na decisão final (ex.: `total_trades >= 40`).
+## PrÃ³ximo foco operacional
+
+- Coletar mais dados.
+- Rodar mais candidatos por seed com validaÃ§Ã£o OOS.
+- Manter pipeline estÃ¡vel (sem alterar lÃ³gica central de treino sem necessidade).
+

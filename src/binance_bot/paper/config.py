@@ -28,11 +28,24 @@ class PaperPositionRules:
     trailing_distance_rr: float
     trailing_lock_breakeven: bool
     disable_take_profit_when_trailing: bool
+    stop_mode: str
+    vol_lookback_steps: int
+    vol_stop_k: float
+    vol_tp_k: float
+    min_stop_loss_pct: float
+    max_stop_loss_pct: float
 
 
 @dataclass(slots=True)
 class PaperStorageConfig:
     base_dir: Path
+
+
+@dataclass(slots=True)
+class PaperMarginSimConfig:
+    enabled: bool
+    max_borrow_notional_brl: float
+    borrow_interest_hourly: float
 
 
 @dataclass(slots=True)
@@ -43,6 +56,7 @@ class PaperModeConfig:
     execution: PaperExecutionConfig
     risk: PaperRiskConfig
     position_rules: PaperPositionRules
+    margin_sim: PaperMarginSimConfig
     storage: PaperStorageConfig
 
 
@@ -88,6 +102,21 @@ def load_paper_mode_config(path: Path | None = None) -> PaperModeConfig:
                 payload.get("position_rules", {}).get(
                     "disable_take_profit_when_trailing", True
                 )
+            ),
+            stop_mode=str(payload.get("position_rules", {}).get("stop_mode", "fixed")).lower(),
+            vol_lookback_steps=int(payload.get("position_rules", {}).get("vol_lookback_steps", 50)),
+            vol_stop_k=float(payload.get("position_rules", {}).get("vol_stop_k", 2.0)),
+            vol_tp_k=float(payload.get("position_rules", {}).get("vol_tp_k", 2.4)),
+            min_stop_loss_pct=float(payload.get("position_rules", {}).get("min_stop_loss_pct", 0.0025)),
+            max_stop_loss_pct=float(payload.get("position_rules", {}).get("max_stop_loss_pct", 0.015)),
+        ),
+        margin_sim=PaperMarginSimConfig(
+            enabled=bool(payload.get("margin_sim", {}).get("enabled", True)),
+            max_borrow_notional_brl=float(
+                payload.get("margin_sim", {}).get("max_borrow_notional_brl", 3000.0)
+            ),
+            borrow_interest_hourly=float(
+                payload.get("margin_sim", {}).get("borrow_interest_hourly", 0.00002)
             ),
         ),
         storage=PaperStorageConfig(

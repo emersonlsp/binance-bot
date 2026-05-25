@@ -21,7 +21,18 @@
     "trailing_activation_rr": 1.0,
     "trailing_distance_rr": 0.75,
     "trailing_lock_breakeven": true,
-    "disable_take_profit_when_trailing": true
+    "disable_take_profit_when_trailing": true,
+    "stop_mode": "volatility",
+    "vol_lookback_steps": 50,
+    "vol_stop_k": 2.0,
+    "vol_tp_k": 2.4,
+    "min_stop_loss_pct": 0.0025,
+    "max_stop_loss_pct": 0.015
+  },
+  "margin_sim": {
+    "enabled": true,
+    "max_borrow_notional_brl": 3000.0,
+    "borrow_interest_hourly": 0.00002
   },
   "storage": {
     "base_dir": "artifacts/paper_mode"

@@ -1,96 +1,210 @@
-# Binance Bot (Collector + XGBoost Clean)
+﻿# Binance Bot (Collector + XGBoost Clean)
 
-Este repositório foi reduzido para manter apenas:
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.mdEste repositÃ³rio foi reduzido para manter apenas:
 - coletor Binance Spot (`BTCBRL`)
 - pipeline de treino/varredura `XGBoost clean`
 
-## Setup
+## Regras de Margin
 
-```powershell
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.md## Setup
+
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.md```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install httpx websockets pyarrow xgboost
 Copy-Item .env.example .env
 ```
 
-## Rodar o coletor
+## Regras de Margin
 
-```powershell
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.md## Rodar o coletor
+
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.md```powershell
 .\.venv\Scripts\python.exe .\run_collector.py
 ```
 
-Duplo clique no Windows:
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.mdDuplo clique no Windows:
 - execute `start_collector.pyw`
 - logs em `logs/collector_YYYYMMDD.log`
 
-Paper runner realtime (simulado, separado do coletor):
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.mdPaper runner realtime (simulado, separado do coletor):
 - execute `start_paper.pyw`
 - artefatos em `artifacts/paper_sim/`
   - `paper_report.json` (resumo atual: trades, win rate, pnl, retorno, drawdown)
   - `signals.jsonl`
   - `trades.jsonl`
 
-Reset do paper simulado:
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.mdReset do paper simulado:
 - pare o `start_paper.pyw`
 - apague `artifacts/paper_sim/paper_report.json`
 - inicie o paper novamente
 
-Saída:
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.mdSaÃ­da:
 - `data/raw/binance/BTCBRL/{snapshots|updates|trades|collector_logs}/YYYY/MM/DD/*.parquet`
 
-## Rodar busca XGBoost clean
+## Regras de Margin
 
-```powershell
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.md## Rodar busca XGBoost clean
+
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.md```powershell
 $env:PYTHONPATH="src"; .\.venv\Scripts\python.exe -m binance_bot.training.run_xgb_clean_search --candidates 60 --folds 4 --min-trades 40 --min-positive-folds 3 --seed 42 --workers 4
 ```
 
-Com regime gate (MT5 candles):
+## Regras de Margin
 
-```powershell
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.mdCom regime gate (MT5 candles):
+
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.md```powershell
 $env:PYTHONPATH="src"; .\.venv\Scripts\python.exe -m binance_bot.training.run_xgb_clean_search --candidates 60 --folds 4 --min-trades 40 --min-positive-folds 3 --seed 42 --workers 4 --regime-gate on --regime-chop-min-confidence 0.78
 ```
 
-Ao terminar:
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.mdAo terminar:
 - mensagem: `[xgb_clean] done. leaderboard: ...`
-- campeão: `artifacts/champion_strategy_xgb_clean.json`
-- relatórios: `artifacts/reports/xgb_clean_search/*.json`
+- campeÃ£o: `artifacts/champion_strategy_xgb_clean.json`
+- relatÃ³rios: `artifacts/reports/xgb_clean_search/*.json`
 - vencedores (`mean_pnl_net_brl > 0`): `artifacts/reports/xgb_clean_search/winners_latest.json`
-- promoção: só ocorre quando XGBoost bate o baseline em PnL e estabilidade por fold (`gate.promote=true`)
+- promoÃ§Ã£o: sÃ³ ocorre quando XGBoost bate o baseline em PnL e estabilidade por fold (`gate.promote=true`)
 
-## MT5: Coleta de velas para regime
+## Regras de Margin
 
-Pré-requisitos:
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.md## MT5: Coleta de velas para regime
+
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.mdPrÃ©-requisitos:
 - MT5 desktop instalado
 - credenciais MT5 no `.env` (`MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER`, `MT5_PATH`)
 
-Coletar velas (`BTCUSD`):
+## Regras de Margin
 
-```powershell
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.mdColetar velas (`BTCUSD`):
+
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.md```powershell
 $env:PYTHONPATH="src"; .\.venv\Scripts\python.exe -m binance_bot.mt5.collect_candles
 ```
 
-Saída:
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.mdSaÃ­da:
 - `data/raw/mt5/BTCUSD/candles/{M1|M5|M15|H1}/*.parquet`
 
-Gerar features de regime:
+## Regras de Margin
 
-```powershell
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.mdGerar features de regime:
+
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.md```powershell
 $env:PYTHONPATH="src"; .\.venv\Scripts\python.exe -m binance_bot.mt5.build_regime_features
 ```
 
-Saída:
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.mdSaÃ­da:
 - `data/processed/mt5/BTCUSD/regime/regime_features_YYYYMMDD.parquet`
 - `artifacts/reports/mt5_regime_summary.json`
 
-## Champion Management
+## Regras de Margin
 
-Arquivar campeao atual (antes de novo treino):
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
 
-```powershell
+- docs/binance_margin_rules.md## Champion Management
+
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.mdArquivar campeao atual (antes de novo treino):
+
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.md```powershell
 $env:PYTHONPATH="src"; .\.venv\Scripts\python.exe -m binance_bot.training.archive_champion
 ```
 
-Promover campeao escolhido manualmente:
+## Regras de Margin
 
-```powershell
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.mdPromover campeao escolhido manualmente:
+
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.md```powershell
 $env:PYTHONPATH="src"; .\.venv\Scripts\python.exe -m binance_bot.training.promote_champion --source artifacts\champions_archive\SEU_ARQUIVO.json
 ```
+
+## Regras de Margin
+
+Para operacao e precificacao realista em margin (borrow/repay, juros, capacidade de emprestimo, erros operacionais e criterios de PnL liquido), consulte:
+
+- docs/binance_margin_rules.md

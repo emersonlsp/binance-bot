@@ -4,7 +4,7 @@
     "default_stop_loss_pct": 0.01,
     "risk_reward_ratio": 1.2,
     "margin_mode": "isolated",
-    "paper_bankroll_brl": 20000.0,
+    "paper_bankroll_brl": 5000.0,
     "order_notional_pct": 0.01,
     "min_position_notional_brl": 50.0,
     "max_position_notional_brl": 3000.0
