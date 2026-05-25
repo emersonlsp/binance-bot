@@ -16,6 +16,7 @@ class MlofiXgbStrategy(Strategy):
     reg_lambda: float = 1.0
     min_confidence: float = 0.45
     n_jobs: int = 4
+    xgb_device: str = "cpu"
     _model: Any = field(default=None, init=False, repr=False)
     _features: list[str] = field(default_factory=list, init=False, repr=False)
 
@@ -49,20 +50,32 @@ class MlofiXgbStrategy(Strategy):
         if len(x) < 50:
             self._model = None
             return
-        self._model = XGBClassifier(
-            objective="multi:softprob",
-            num_class=3,
-            n_estimators=self.n_estimators,
-            max_depth=self.max_depth,
-            learning_rate=self.learning_rate,
-            subsample=self.subsample,
-            colsample_bytree=self.colsample_bytree,
-            reg_lambda=self.reg_lambda,
-            eval_metric="mlogloss",
-            random_state=42,
-            n_jobs=self.n_jobs,
-        )
-        self._model.fit(x, y)
+        kwargs = {
+            "objective": "multi:softprob",
+            "num_class": 3,
+            "n_estimators": self.n_estimators,
+            "max_depth": self.max_depth,
+            "learning_rate": self.learning_rate,
+            "subsample": self.subsample,
+            "colsample_bytree": self.colsample_bytree,
+            "reg_lambda": self.reg_lambda,
+            "eval_metric": "mlogloss",
+            "random_state": 42,
+            "n_jobs": self.n_jobs,
+            "tree_method": "hist",
+        }
+        if str(self.xgb_device).lower() == "cuda":
+            kwargs["device"] = "cuda"
+        self._model = XGBClassifier(**kwargs)
+        try:
+            self._model.fit(x, y)
+        except Exception:
+            if str(self.xgb_device).lower() != "cuda":
+                raise
+            # Graceful fallback for environments without CUDA-enabled XGBoost runtime.
+            kwargs.pop("device", None)
+            self._model = XGBClassifier(**kwargs)
+            self._model.fit(x, y)
 
     def predict(self, row: dict[str, Any]) -> Signal:
         if self._model is None:
@@ -73,8 +86,13 @@ class MlofiXgbStrategy(Strategy):
                 entry_reason="model_not_fitted",
                 metadata={"strategy": self.name},
             )
-        x = [self._build_features(row)]
-        probs = self._model.predict_proba(x)[0]
+        # Use explicit DMatrix prediction to avoid repeated sklearn inplace_predict
+        # device-mismatch warnings when training on CUDA and scoring CPU inputs.
+        import numpy as np
+        from xgboost import DMatrix
+
+        x = np.asarray([self._build_features(row)], dtype=np.float32)
+        probs = self._model.get_booster().predict(DMatrix(x))[0]
         pred_cls = int(max(range(len(probs)), key=lambda i: probs[i]))
         confidence = float(probs[pred_cls])
         # Map {0,1,2} -> {-1,0,1}

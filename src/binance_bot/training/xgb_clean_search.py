@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -25,6 +26,108 @@ class SearchConfig:
     workers: int = 1
     regime_gate: bool = False
     regime_chop_min_confidence: float = 0.78
+    xgb_device: str = "cpu"
+
+
+def _champion_sort_key(entry: dict[str, Any]) -> tuple[float, float, float]:
+    summary = entry.get("summary", {})
+    score = float(entry.get("score", summary.get("mean_pnl_net_brl", 0.0)))
+    pnl = float(summary.get("mean_pnl_net_brl", 0.0))
+    trades = float(summary.get("total_trades", 0.0))
+    return (score, pnl, trades)
+
+
+def _archive_and_promote_if_better(
+    candidate: dict[str, Any],
+    *,
+    current_reference: dict[str, Any] | None,
+    champion_file: Path,
+    archive_dir: Path,
+) -> tuple[bool, str]:
+    current: dict[str, Any] | None = None
+    if champion_file.exists():
+        current = json.loads(champion_file.read_text(encoding="utf-8"))
+    reference = current_reference if current_reference is not None else current
+    if reference is not None and _champion_sort_key(candidate) <= _champion_sort_key(reference):
+        msg = (
+            "[xgb_clean] champion_action: kept_current_champion "
+            "(promoted candidate did not beat active champion)"
+        )
+        print(msg)
+        return False, msg
+    archived_path = ""
+    if current is not None:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+        current_name = str(current.get("name", "champion"))
+        archive_path = archive_dir / f"{ts}_{current_name}.json"
+        archive_path.write_text(json.dumps(current, indent=2), encoding="utf-8")
+        archived_path = str(archive_path)
+        print(f"[xgb_clean] archived current champion: {archive_path}")
+    champion_file.parent.mkdir(parents=True, exist_ok=True)
+    champion_file.write_text(json.dumps(candidate, indent=2), encoding="utf-8")
+    print(f"[xgb_clean] active champion updated: {champion_file}")
+    msg = (
+        f"[xgb_clean] champion_action: promoted_new_champion + archived_old "
+        f"(archive={archived_path if archived_path else 'none'})"
+    )
+    print(msg)
+    return True, msg
+
+
+def _evaluate_existing_champion_on_current_data(
+    *,
+    current: dict[str, Any],
+    dataset_by_key: dict[tuple[int, float, int], dict[str, Any]],
+    baseline_ref_by_key: dict[tuple[int, float, int], dict[str, Any]],
+    output_dir: Path,
+    cfg: SearchConfig,
+) -> dict[str, Any] | None:
+    params = dict(current.get("params", {}))
+    try:
+        h = int(params["horizon_steps"])
+        m = float(params["move_threshold_bps"])
+        s_upd = int(params["sample_every_updates"])
+        n_folds = int(params.get("n_folds", cfg.n_folds))
+        min_sig = float(params["min_signal_confidence"])
+        max_spread = float(params["max_spread_brl"])
+        cost = float(params.get("cost_bps_per_side", 1.5))
+        strategy_kwargs = dict(params.get("strategy_kwargs", {}))
+    except Exception:
+        return None
+
+    key = (h, m, s_upd)
+    dataset = dataset_by_key.get(key)
+    baseline_ref = baseline_ref_by_key.get(key)
+    if dataset is None or baseline_ref is None:
+        return None
+    dataset_key = f"h{h}_m{str(m).replace('.', '_')}_s{s_upd}"
+    candidate_like = {
+        "name": str(current.get("name", "active_champion")),
+        "strategy_name": str(current.get("strategy_name", "mlofi_xgb_v1")),
+        "strategy_kwargs": strategy_kwargs,
+        "horizon_steps": h,
+        "move_threshold_bps": m,
+        "sample_every_updates": s_upd,
+        "cost_bps_per_side": cost,
+        "min_signal_confidence": min_sig,
+        "max_spread_brl": max_spread,
+    }
+    entry = _evaluate_candidate(
+        candidate_like,
+        search_seed=int(params.get("search_seed", cfg.seed)),
+        output_dir=output_dir,
+        dataset=dataset,
+        dataset_key=dataset_key,
+        sample_every_updates=s_upd,
+        n_folds=n_folds,
+        min_trades=cfg.min_trades,
+        min_positive_folds=cfg.min_positive_folds,
+        baseline_ref=baseline_ref,
+        regime_gate_enabled=cfg.regime_gate,
+        regime_chop_min_confidence=cfg.regime_chop_min_confidence,
+    )
+    return entry
 
 
 def _sample_candidate(
@@ -32,6 +135,7 @@ def _sample_candidate(
     idx: int,
     *,
     xgb_n_jobs: int,
+    xgb_device: str,
     data_profile: tuple[int, float, int],
 ) -> dict[str, Any]:
     horizon_steps, move_threshold_bps, sample_every_updates = data_profile
@@ -46,6 +150,7 @@ def _sample_candidate(
         "reg_lambda": rng.choice([0.5, 1.0, 2.0, 5.0]),
         "min_confidence": rng.choice([0.55, 0.60, 0.65, 0.70]),
         "n_jobs": xgb_n_jobs,
+        "xgb_device": xgb_device,
     }
     return {
         "name": f"xgb_clean_{idx:03d}",
@@ -153,6 +258,7 @@ def _best_baseline(baselines: list[dict[str, Any]]) -> dict[str, Any]:
 def _evaluate_candidate(
     candidate: dict[str, Any],
     *,
+    search_seed: int,
     output_dir: Path,
     dataset: dict[str, Any],
     dataset_key: str,
@@ -181,6 +287,7 @@ def _evaluate_candidate(
     entry = {
         "name": candidate["name"],
         "params": {
+            "search_seed": search_seed,
             "horizon_steps": candidate["horizon_steps"],
             "move_threshold_bps": candidate["move_threshold_bps"],
             "sample_every_updates": candidate["sample_every_updates"],
@@ -221,6 +328,7 @@ def _evaluate_candidate(
 def _evaluate_group(
     *,
     candidates: list[dict[str, Any]],
+    search_seed: int,
     output_dir: Path,
     dataset: dict[str, Any],
     dataset_key: str,
@@ -237,6 +345,7 @@ def _evaluate_group(
         out.append(
             _evaluate_candidate(
                 candidate,
+                search_seed=search_seed,
                 output_dir=output_dir,
                 dataset=dataset,
                 dataset_key=dataset_key,
@@ -310,6 +419,7 @@ def run_xgb_clean_search(
     output_dir: Path,
     cfg: SearchConfig,
 ) -> dict[str, Any]:
+    t0 = time.perf_counter()
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = Path("data/features/binance/BTCBRL/xgb_clean_cache")
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -333,11 +443,14 @@ def run_xgb_clean_search(
             rng,
             i,
             xgb_n_jobs=xgb_n_jobs,
+            xgb_device=cfg.xgb_device,
             data_profile=rng.choice(data_profiles),
         )
         for i in range(1, cfg.candidates + 1)
     ]
     entries: list[dict[str, Any]] = []
+    total_candidates = len(candidates)
+    completed_candidates = 0
     groups: dict[tuple[int, float, int], list[dict[str, Any]]] = {}
     for c in candidates:
         key = (
@@ -351,6 +464,8 @@ def run_xgb_clean_search(
     dataset_by_key: dict[tuple[int, float, int], dict[str, Any]] = {}
     baseline_by_key: dict[tuple[int, float, int], list[dict[str, Any]]] = {}
     baseline_ref_by_key: dict[tuple[int, float, int], dict[str, Any]] = {}
+    cache_hit_count = 0
+    cache_build_count = 0
     for key, _group in groups.items():
         h, m, s = key
         key_name = f"h{h}_m{str(m).replace('.', '_')}_s{s}"
@@ -368,6 +483,7 @@ def run_xgb_clean_search(
             if cfg.regime_gate:
                 _attach_regime_labels(dataset_by_key[key], regime_times, regime_labels)
             print(f"[xgb_clean] cache hit: {key_name} rows={len(labeled_rows)}")
+            cache_hit_count += 1
             continue
         dataset = build_paper_aligned_dataset(
             raw_root=raw_root,
@@ -382,6 +498,7 @@ def run_xgb_clean_search(
         if cfg.regime_gate:
             _attach_regime_labels(dataset_by_key[key], regime_times, regime_labels)
         print(f"[xgb_clean] cache build: {key_name} rows={len(dataset['labeled_rows'])}")
+        cache_build_count += 1
         baselines = _evaluate_baselines(
             output_dir=output_dir,
             dataset=dataset_by_key[key],
@@ -400,6 +517,7 @@ def run_xgb_clean_search(
             f"pnl_brl={float(ref['summary'].get('mean_pnl_net_brl', 0.0)):.2f} "
             f"stability={float(ref['stability'].get('positive_ratio', 0.0)):.2f}"
         )
+    t_after_cache = time.perf_counter()
 
     for key, ds in dataset_by_key.items():
         if key in baseline_by_key:
@@ -434,6 +552,7 @@ def run_xgb_clean_search(
             for candidate in group:
                 entry = _evaluate_candidate(
                     candidate,
+                    search_seed=cfg.seed,
                     output_dir=output_dir,
                     dataset=ds,
                     dataset_key=key_name,
@@ -452,6 +571,8 @@ def run_xgb_clean_search(
                     f"exp={s['mean_expectancy_brl_per_trade']:.2f} trades={s['total_trades']} "
                     f"score={entry['score']:.2f}"
                 )
+                completed_candidates += 1
+                print(f"[xgb_clean] progress {completed_candidates}/{total_candidates}", flush=True)
     else:
         with ProcessPoolExecutor(max_workers=cfg.workers) as ex:
             futures = {}
@@ -460,31 +581,34 @@ def run_xgb_clean_search(
                 key_name = f"h{h}_m{str(m).replace('.', '_')}_s{s_upd}"
                 ds = dataset_by_key[key]
                 baseline_ref = baseline_ref_by_key[key]
-                fut = ex.submit(
-                    _evaluate_group,
-                    candidates=group,
-                    output_dir=output_dir,
-                    dataset=ds,
-                    dataset_key=key_name,
-                    sample_every_updates=s_upd,
-                    n_folds=cfg.n_folds,
-                    min_trades=cfg.min_trades,
-                    min_positive_folds=cfg.min_positive_folds,
-                    baseline_ref=baseline_ref,
-                    regime_gate_enabled=cfg.regime_gate,
-                    regime_chop_min_confidence=cfg.regime_chop_min_confidence,
-                )
-                futures[fut] = key_name
-            for fut in as_completed(futures):
-                batch = fut.result()
-                for entry in batch:
-                    entries.append(entry)
-                    s = entry["summary"]
-                    print(
-                        f"[xgb_clean] {entry['name']} pnl_brl={s['mean_pnl_net_brl']:.2f} "
-                        f"exp={s['mean_expectancy_brl_per_trade']:.2f} trades={s['total_trades']} "
-                        f"score={entry['score']:.2f}"
+                for candidate in group:
+                    fut = ex.submit(
+                        _evaluate_candidate,
+                        candidate,
+                        search_seed=cfg.seed,
+                        output_dir=output_dir,
+                        dataset=ds,
+                        dataset_key=key_name,
+                        sample_every_updates=s_upd,
+                        n_folds=cfg.n_folds,
+                        min_trades=cfg.min_trades,
+                        min_positive_folds=cfg.min_positive_folds,
+                        baseline_ref=baseline_ref,
+                        regime_gate_enabled=cfg.regime_gate,
+                        regime_chop_min_confidence=cfg.regime_chop_min_confidence,
                     )
+                    futures[fut] = candidate["name"]
+            for fut in as_completed(futures):
+                entry = fut.result()
+                entries.append(entry)
+                s = entry["summary"]
+                print(
+                    f"[xgb_clean] {entry['name']} pnl_brl={s['mean_pnl_net_brl']:.2f} "
+                    f"exp={s['mean_expectancy_brl_per_trade']:.2f} trades={s['total_trades']} "
+                    f"score={entry['score']:.2f}"
+                )
+                completed_candidates += 1
+                print(f"[xgb_clean] progress {completed_candidates}/{total_candidates}", flush=True)
 
     entries.sort(key=lambda x: float(x["score"]), reverse=True)
     champion = entries[0] if entries else None
@@ -511,6 +635,16 @@ def run_xgb_clean_search(
         "winners_count": len(winners),
         "baselines_by_dataset": {
             f"h{k[0]}_m{str(k[1]).replace('.', '_')}_s{k[2]}": v for k, v in baseline_by_key.items()
+        },
+        "champion_action": "none",
+        "timing": {
+            "cache_phase_seconds": round(t_after_cache - t0, 3),
+            "candidate_phase_seconds": 0.0,
+            "total_seconds": 0.0,
+            "cache_hit_count": cache_hit_count,
+            "cache_build_count": cache_build_count,
+            "dataset_groups_count": len(groups),
+            "candidates_count": len(candidates),
         },
     }
     (output_dir / "leaderboard.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -551,7 +685,49 @@ def run_xgb_clean_search(
     )
 
     if promoted_champion:
-        Path("artifacts/champion_strategy_xgb_clean.json").write_text(
-            json.dumps(promoted_champion, indent=2), encoding="utf-8"
+        current_ref: dict[str, Any] | None = None
+        champion_file = Path("artifacts/champion_strategy_xgb_clean.json")
+        if champion_file.exists():
+            try:
+                current_payload = json.loads(champion_file.read_text(encoding="utf-8"))
+                current_ref = _evaluate_existing_champion_on_current_data(
+                    current=current_payload,
+                    dataset_by_key=dataset_by_key,
+                    baseline_ref_by_key=baseline_ref_by_key,
+                    output_dir=output_dir,
+                    cfg=cfg,
+                )
+                if current_ref is not None:
+                    cs = current_ref.get("summary", {})
+                    print(
+                        "[xgb_clean] current_active_reval:",
+                        current_ref.get("name", "active_champion"),
+                        "pnl_brl=",
+                        round(float(cs.get("mean_pnl_net_brl", 0.0)), 2),
+                        "trades=",
+                        int(cs.get("total_trades", 0)),
+                    )
+            except Exception:
+                current_ref = None
+        _, action_msg = _archive_and_promote_if_better(
+            promoted_champion,
+            current_reference=current_ref,
+            champion_file=champion_file,
+            archive_dir=Path("artifacts/champions_archive"),
         )
+        payload["champion_action"] = action_msg
+    else:
+        payload["champion_action"] = "[xgb_clean] champion_action: kept_current_champion (no promoted candidate)"
+        print(payload["champion_action"])
+    t_end = time.perf_counter()
+    payload["timing"]["candidate_phase_seconds"] = round(t_end - t_after_cache, 3)
+    payload["timing"]["total_seconds"] = round(t_end - t0, 3)
+    (output_dir / "leaderboard.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(
+        f"[xgb_clean] timing cache={payload['timing']['cache_phase_seconds']:.1f}s "
+        f"candidates={payload['timing']['candidate_phase_seconds']:.1f}s "
+        f"total={payload['timing']['total_seconds']:.1f}s "
+        f"cache_hit={cache_hit_count} cache_build={cache_build_count}",
+        flush=True,
+    )
     return payload

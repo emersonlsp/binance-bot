@@ -30,6 +30,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Parallel worker processes (use 2-6 depending on CPU/RAM).",
     )
     p.add_argument(
+        "--xgb-device",
+        choices=["cpu", "cuda"],
+        default="cpu",
+        help="XGBoost device. Use 'cuda' for NVIDIA GPU acceleration.",
+    )
+    p.add_argument(
         "--regime-gate",
         choices=["on", "off"],
         default="off",
@@ -65,6 +71,7 @@ def main() -> None:
         min_positive_folds=args.min_positive_folds,
         seed=args.seed,
         workers=args.workers,
+        xgb_device=args.xgb_device,
         regime_gate=(args.regime_gate == "on"),
         regime_chop_min_confidence=args.regime_chop_min_confidence,
     )

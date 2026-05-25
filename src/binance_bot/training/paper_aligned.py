@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,12 +26,134 @@ def _minute_bucket(ts: datetime) -> str:
     return ts.strftime("%Y-%m-%dT%H:%M")
 
 
-def _read_all_rows(root: Path) -> list[dict[str, Any]]:
+def _rel_day_key(root: Path, file_path: Path) -> str:
+    rel_parts = file_path.relative_to(root).parts
+    if len(rel_parts) >= 4:
+        return "/".join(rel_parts[:3])  # YYYY/MM/DD
+    return "unknown"
+
+
+def _file_sig(path: Path) -> dict[str, int]:
+    st = path.stat()
+    return {"size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns)}
+
+
+def _read_parquet_rows_batched(path: Path, columns: list[str], batch_size: int = 50_000) -> list[dict[str, Any]]:
+    pf = pq.ParquetFile(path)
+    out: list[dict[str, Any]] = []
+    for batch in pf.iter_batches(batch_size=batch_size, columns=columns):
+        out.extend(pa.Table.from_batches([batch]).to_pylist())
+    return out
+
+
+def _read_day_rows_parallel(day_files: list[Path], columns: list[str], workers: int) -> list[dict[str, Any]]:
+    if not day_files:
+        return []
+    if workers <= 1 or len(day_files) == 1:
+        out: list[dict[str, Any]] = []
+        for f in day_files:
+            out.extend(_read_parquet_rows_batched(f, columns))
+        return out
+    out: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(_read_parquet_rows_batched, f, columns) for f in day_files]
+        for fut in futures:
+            out.extend(fut.result())
+    return out
+
+
+def _load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _read_all_rows_incremental_cached(
+    *,
+    root: Path,
+    cache_root: Path,
+    stream_name: str,
+    columns: list[str],
+    workers: int,
+) -> list[dict[str, Any]]:
     files = sorted(root.rglob("*.parquet"))
-    rows: list[dict[str, Any]] = []
+    cache_root.mkdir(parents=True, exist_ok=True)
+    stream_cache = cache_root / stream_name
+    stream_cache.mkdir(parents=True, exist_ok=True)
+    manifest_path = stream_cache / "manifest.json"
+
+    prev = _load_json(manifest_path, default={"files": {}, "days": {}})
+    prev_files: dict[str, dict[str, int]] = dict(prev.get("files", {}))
+    prev_days: dict[str, list[str]] = {k: list(v) for k, v in dict(prev.get("days", {})).items()}
+
+    curr_files: dict[str, dict[str, int]] = {}
+    curr_days: dict[str, list[str]] = {}
+    days_to_rebuild: set[str] = set()
+
     for f in files:
-        rows.extend(pq.read_table(f).to_pylist())
-    return rows
+        rel = f.relative_to(root).as_posix()
+        day = _rel_day_key(root, f)
+        sig = _file_sig(f)
+        curr_files[rel] = sig
+        curr_days.setdefault(day, []).append(rel)
+        if prev_files.get(rel) != sig:
+            days_to_rebuild.add(day)
+
+    removed = set(prev_files.keys()) - set(curr_files.keys())
+    for rel in removed:
+        old_day = None
+        for d, rels in prev_days.items():
+            if rel in rels:
+                old_day = d
+                break
+        if old_day is not None:
+            days_to_rebuild.add(old_day)
+
+    # Rebuild only changed day partitions.
+    for day in sorted(days_to_rebuild):
+        rels = curr_days.get(day, [])
+        day_files = [root / rel for rel in rels]
+        rows = _read_day_rows_parallel(day_files, columns, workers=workers)
+        day_dir = stream_cache / day
+        day_dir.mkdir(parents=True, exist_ok=True)
+        day_file = day_dir / "rows.parquet"
+        if not rows:
+            if day_file.exists():
+                day_file.unlink()
+            continue
+        table = pa.Table.from_pylist(rows)
+        pq.write_table(table, day_file)
+
+    # Remove stale day caches no longer present.
+    curr_day_keys = set(curr_days.keys())
+    for d in prev_days.keys():
+        if d not in curr_day_keys:
+            stale_dir = stream_cache / d
+            if stale_dir.exists():
+                for p in stale_dir.rglob("*"):
+                    if p.is_file():
+                        p.unlink()
+                for p in sorted(stale_dir.rglob("*"), reverse=True):
+                    if p.is_dir():
+                        p.rmdir()
+                if stale_dir.exists():
+                    stale_dir.rmdir()
+
+    # Persist new manifest.
+    manifest = {"files": curr_files, "days": curr_days}
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    # Read merged rows from all day partitions.
+    rows_out: list[dict[str, Any]] = []
+    for day in sorted(curr_days.keys()):
+        day_file = stream_cache / day / "rows.parquet"
+        if not day_file.exists():
+            continue
+        rows_out.extend(_read_parquet_rows_batched(day_file, columns))
+    return rows_out
 
 
 def _collect_bad_minutes(log_rows: list[dict[str, Any]]) -> set[str]:
@@ -623,8 +747,22 @@ def build_paper_aligned_dataset(
     sample_every_updates: int,
     feature_output_path: Path | None = None,
 ) -> dict[str, Any]:
-    update_rows = _read_all_rows(raw_root / "updates")
-    log_rows = _read_all_rows(raw_root / "collector_logs")
+    cache_root = Path("data/features/binance/BTCBRL/raw_event_cache")
+    io_workers = max(1, min(8, (os.cpu_count() or 4)))
+    update_rows = _read_all_rows_incremental_cached(
+        root=raw_root / "updates",
+        cache_root=cache_root,
+        stream_name="updates",
+        columns=["ts_receive", "symbol", "session_id", "side", "price", "size"],
+        workers=io_workers,
+    )
+    log_rows = _read_all_rows_incremental_cached(
+        root=raw_root / "collector_logs",
+        cache_root=cache_root,
+        stream_name="collector_logs",
+        columns=["ts_event", "event_type"],
+        workers=io_workers,
+    )
     bad_minutes = _collect_bad_minutes(log_rows)
     feature_rows = _build_event_time_features(
         update_rows=update_rows,

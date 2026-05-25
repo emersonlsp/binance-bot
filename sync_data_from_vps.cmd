@@ -37,6 +37,48 @@ echo [sync] MT5 sync finished. robocopy exit code: %ERRORLEVEL%
 
 :DONE
 echo.
-echo [sync] Completed.
-endlocal
+echo [sync] Sync completed. Preparing MT5 regime features...
 
+echo [sync] Clearing feature caches to force rebuild with newest data...
+set "CACHE_XGB=%ROOT%data\features\binance\BTCBRL\xgb_clean_cache"
+set "CACHE_SINGLE=%ROOT%data\features\binance\BTCBRL\single_eval_cache"
+if exist "%CACHE_XGB%" (
+  rmdir /S /Q "%CACHE_XGB%"
+  echo [sync] Cleared: %CACHE_XGB%
+)
+if exist "%CACHE_SINGLE%" (
+  rmdir /S /Q "%CACHE_SINGLE%"
+  echo [sync] Cleared: %CACHE_SINGLE%
+)
+
+set "PYTHON_EXE=%ROOT%.venv\Scripts\python.exe"
+if not exist "%PYTHON_EXE%" (
+  echo [sync] Python venv not found at: %PYTHON_EXE%
+  echo [sync] Skipping regime build.
+  goto :END
+)
+
+set "PYTHONPATH=src"
+pushd "%ROOT%"
+"%PYTHON_EXE%" -m binance_bot.mt5.collect_candles
+if errorlevel 1 (
+  echo [sync] MT5 local candle collect failed. Check logs/output above.
+  popd
+  goto :END
+) else (
+  echo [sync] MT5 local candle collect finished successfully.
+)
+
+"%PYTHON_EXE%" -m binance_bot.mt5.build_regime_features
+if errorlevel 1 (
+  echo [sync] Regime build failed. Check logs/output above.
+) else (
+  echo [sync] Regime build finished successfully.
+)
+popd
+
+:END
+echo [sync] Completed.
+echo.
+pause
+endlocal
