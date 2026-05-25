@@ -68,20 +68,50 @@ def _day_dir_date(day_dir: Path) -> datetime | None:
         return None
 
 
+def _latest_file_info(stream_src: Path) -> tuple[datetime | None, str | None]:
+    latest_ts: datetime | None = None
+    latest_rel: str | None = None
+    for day_dir in _stream_day_dirs(stream_src):
+        for src_file in sorted(day_dir.glob("*.parquet")):
+            fts = _parse_file_ts(src_file)
+            if fts is None:
+                continue
+            rel = src_file.relative_to(stream_src).as_posix()
+            if latest_ts is None or fts > latest_ts or (fts == latest_ts and rel > (latest_rel or "")):
+                latest_ts = fts
+                latest_rel = rel
+    return latest_ts, latest_rel
+
+
 def _copy_stream_incremental(
     stream_name: str,
     stream_src: Path,
     stream_dst: Path,
-    state_ts_iso: str | None,
+    state_entry: dict[str, Any] | None,
     safety_hours: int,
-) -> tuple[SyncStats, str | None]:
+) -> tuple[SyncStats, dict[str, Any]]:
     stats = SyncStats()
+    state_entry = state_entry or {}
+    state_ts_iso = state_entry.get("last_ts")
+    state_last_file = state_entry.get("last_file")
     last_ts: datetime | None = None
     if state_ts_iso:
         try:
             last_ts = datetime.fromisoformat(state_ts_iso.replace("Z", "+00:00")).astimezone(UTC)
         except ValueError:
             last_ts = None
+    src_latest_ts, src_latest_file = _latest_file_info(stream_src)
+
+    # Fast skip: source tip unchanged since last sync for this stream.
+    if (
+        last_ts is not None
+        and src_latest_ts is not None
+        and src_latest_ts == last_ts
+        and src_latest_file
+        and src_latest_file == state_last_file
+    ):
+        return stats, {"last_ts": state_ts_iso, "last_file": state_last_file}
+
     floor = (last_ts - timedelta(hours=max(0, safety_hours))) if last_ts else None
 
     day_dirs = _stream_day_dirs(stream_src)
@@ -90,6 +120,7 @@ def _copy_stream_incremental(
         day_dirs = [d for d in day_dirs if (_day_dir_date(d) or floor_day) >= floor_day]
 
     max_seen_ts = last_ts
+    max_seen_file = state_last_file
     for day_dir in day_dirs:
         rel_day = day_dir.relative_to(stream_src)
         dst_day = stream_dst / rel_day
@@ -105,10 +136,19 @@ def _copy_stream_incremental(
             else:
                 shutil.copy2(src_file, dst_file)
                 stats.copied += 1
-            if fts is not None and (max_seen_ts is None or fts > max_seen_ts):
-                max_seen_ts = fts
-    next_state = max_seen_ts.isoformat() if max_seen_ts is not None else state_ts_iso
-    return stats, next_state
+            if fts is not None:
+                rel_file = src_file.relative_to(stream_src).as_posix()
+                if (
+                    max_seen_ts is None
+                    or fts > max_seen_ts
+                    or (fts == max_seen_ts and rel_file > (max_seen_file or ""))
+                ):
+                    max_seen_ts = fts
+                    max_seen_file = rel_file
+    return stats, {
+        "last_ts": max_seen_ts.isoformat() if max_seen_ts is not None else state_ts_iso,
+        "last_file": max_seen_file,
+    }
 
 
 def sync_tree(
@@ -129,12 +169,13 @@ def sync_tree(
     for stream_dir in streams:
         stream = stream_dir.name
         dst_stream = dst_root / stream
-        prev_ts = streams_state.get(stream)
+        prev_entry_raw = streams_state.get(stream, {})
+        prev_entry = prev_entry_raw if isinstance(prev_entry_raw, dict) else {"last_ts": prev_entry_raw}
         stats, next_ts = _copy_stream_incremental(
             stream,
             stream_dir,
             dst_stream,
-            prev_ts,
+            prev_entry,
             safety_hours=safety_hours,
         )
         streams_state[stream] = next_ts
@@ -143,7 +184,7 @@ def sync_tree(
         total_skipped_existing += stats.skipped_existing
         print(
             f"[sync-block] stream={stream} scanned={stats.scanned} "
-            f"copied={stats.copied} exists={stats.skipped_existing} last_ts={next_ts}"
+            f"copied={stats.copied} exists={stats.skipped_existing} last_ts={next_ts.get('last_ts')}"
         )
     _write_json(
         state_file,
@@ -173,4 +214,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
